@@ -1,0 +1,1610 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>血壓心率健康紀錄管理工具</title>
+  
+  <!-- 載入 Tailwind CSS (排版美化) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- 載入 React 與 ReactDOM 核心 -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  
+  <!-- 載入 Babel (用於在瀏覽器中即時解析 JSX 語法) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-slate-50">
+  <div id="root"></div>
+
+  <!-- React 程式碼區塊 -->
+  <script type="text/babel">
+    const { useState, useMemo, useEffect } = React;
+
+    // ----------------------------------------------------
+    // 模擬數據：僅在使用者第一次打開、且本地完全無資料時預載
+    // ----------------------------------------------------
+    const generateMockData = () => {
+      const data = [];
+      const now = new Date();
+      for (let i = 13; i >= 0; i--) {
+        const date = new Date(now);
+        date.setDate(now.getDate() - i);
+        const dateStr = date.toISOString().split('T')[0];
+        
+        const morningCount = 2;
+        const morningReadings = [
+          { systolic: 122, diastolic: 80, pulse: 68 },
+          { systolic: 118, diastolic: 78, pulse: 66 }
+        ];
+        data.push({
+          id: `${dateStr}-morning`,
+          date: dateStr,
+          period: 'morning',
+          readings: morningReadings,
+          avgSystolic: Math.round(morningReadings.reduce((sum, r) => sum + r.systolic, 0) / morningCount),
+          avgDiastolic: Math.round(morningReadings.reduce((sum, r) => sum + r.diastolic, 0) / morningCount),
+          avgPulse: Math.round(morningReadings.reduce((sum, r) => sum + r.pulse, 0) / morningCount),
+        });
+
+        const eveningCount = 2;
+        const eveningReadings = [
+          { systolic: 116, diastolic: 75, pulse: 72 },
+          { systolic: 114, diastolic: 73, pulse: 70 }
+        ];
+        data.push({
+          id: `${dateStr}-evening`,
+          date: dateStr,
+          period: 'evening',
+          readings: eveningReadings,
+          avgSystolic: Math.round(eveningReadings.reduce((sum, r) => sum + r.systolic, 0) / eveningCount),
+          avgDiastolic: Math.round(eveningReadings.reduce((sum, r) => sum + r.diastolic, 0) / eveningCount),
+          avgPulse: Math.round(eveningReadings.reduce((sum, r) => sum + r.pulse, 0) / eveningCount),
+        });
+      }
+      return data;
+    };
+
+    // ----------------------------------------------------
+    // 血壓等級判定邏輯 (AHA/ACC 標準)
+    // ----------------------------------------------------
+    const getBPLevel = (sys, dia) => {
+      if (sys >= 180 || dia >= 120) {
+        return { label: '高血壓危機', color: 'text-rose-600 bg-rose-50 border-rose-200', dotColor: '#e11d48' };
+      }
+      if (sys >= 140 || dia >= 90) {
+        return { label: '二期高血壓', color: 'text-red-500 bg-red-50 border-red-200', dotColor: '#ef4444' };
+      }
+      if ((sys >= 130 && sys <= 139) || (dia >= 80 && dia <= 89)) {
+        return { label: '一期高血壓', color: 'text-amber-500 bg-amber-50 border-amber-200', dotColor: '#f59e0b' };
+      }
+      if ((sys >= 120 && sys <= 129) && dia < 80) {
+        return { label: '血壓偏高', color: 'text-yellow-500 bg-yellow-50 border-yellow-200', dotColor: '#eab308' };
+      }
+      return { label: '正常血壓', color: 'text-emerald-500 bg-emerald-50 border-emerald-200', dotColor: '#10b981' };
+    };
+
+    function App() {
+      // ----------------------------------------------------
+      // 狀態管理 (雙驅動儲存：LocalStorage 優先)
+      // ----------------------------------------------------
+      const [records, setRecords] = useState(() => {
+        const local = localStorage.getItem('bp_tracker_records_v2');
+        return local ? JSON.parse(local) : generateMockData();
+      });
+
+      const [gasUrl, setGasUrl] = useState(() => {
+        return localStorage.getItem('bp_tracker_gas_url') || '';
+      });
+
+      // 安全密鑰狀態 (自訂驗證密碼)
+      const [securityKey, setSecurityKey] = useState(() => {
+        return localStorage.getItem('bp_tracker_security_key') || '';
+      });
+
+      // UI 與同步狀態
+      const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'history' | 'cloud' | 'guide'
+      const [syncLoading, setSyncLoading] = useState(false);
+      const [notification, setNotification] = useState(null); // { type: 'success'|'error'|'info', text: string }
+      
+      // 自訂對話框/確認框
+      const [customConfirm, setCustomConfirm] = useState(null); 
+      const [customAlert, setCustomAlert] = useState(null); 
+
+      // 篩選器狀態
+      const [datePreset, setDatePreset] = useState('14days');
+      const [startDate, setStartDate] = useState(() => {
+        const d = new Date();
+        d.setDate(d.getDate() - 13);
+        return d.toISOString().split('T')[0];
+      });
+      const [endDate, setEndDate] = useState(new Date().toISOString().split('T')[0]);
+      const [filterPeriod, setFilterPeriod] = useState('all');
+      const [filterMetric, setFilterMetric] = useState('all');
+      
+      // 表單狀態
+      const [showModal, setShowModal] = useState(false);
+      const [editId, setEditId] = useState(null);
+      const [formDate, setFormDate] = useState(new Date().toISOString().split('T')[0]);
+      const [formPeriod, setFormPeriod] = useState(() => {
+        const hour = new Date().getHours();
+        return hour < 12 ? 'morning' : 'evening';
+      });
+      const [formReadings, setFormReadings] = useState([
+        { systolic: 120, diastolic: 80, pulse: 70 }
+      ]);
+
+      const [hoveredIndex, setHoveredIndex] = useState(null);
+
+      // ----------------------------------------------------
+      // 自動將變更寫入 LocalStorage
+      // ----------------------------------------------------
+      useEffect(() => {
+        localStorage.setItem('bp_tracker_records_v2', JSON.stringify(records));
+      }, [records]);
+
+      useEffect(() => {
+        localStorage.setItem('bp_tracker_gas_url', gasUrl);
+      }, [gasUrl]);
+
+      useEffect(() => {
+        localStorage.setItem('bp_tracker_security_key', securityKey);
+      }, [securityKey]);
+
+      // ----------------------------------------------------
+      // 通知提示框自動關閉
+      // ----------------------------------------------------
+      const triggerNotification = (type, text) => {
+        setNotification({ type, text });
+        setTimeout(() => {
+          setNotification(null);
+        }, 4000);
+      };
+
+      // ----------------------------------------------------
+      // GOOGLE SHEET 雲端同步核心 API
+      // ----------------------------------------------------
+      
+      // 1. 匯出當前全部紀錄至 Google Sheets
+      const handleCloudExport = async () => {
+        if (!gasUrl) {
+          setCustomAlert({
+            title: "尚未設定雲端網址",
+            message: "請前往「雲端安全設定」分頁，貼上您的 Google Apps Script 部署網址再進行同步。"
+          });
+          return;
+        }
+
+        if (!securityKey || securityKey.trim() === "") {
+          setCustomAlert({
+            title: "⚠️ 安全防護：密鑰不可空白",
+            message: "為了保護您的個人醫療隱私，當您啟用雲端同步功能時，「安全密鑰（密碼）」絕不可留空。請至『雲端安全設定』設定您的密碼。"
+          });
+          return;
+        }
+
+        setSyncLoading(true);
+        triggerNotification('info', '正在將資料加密上傳至 Google 試算表...');
+
+        try {
+          const trimmedKey = securityKey.trim();
+
+          const payload = {
+            action: 'saveAll',
+            key: trimmedKey, 
+            records: records
+          };
+
+          const response = await fetch(gasUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'text/plain;charset=utf-8',
+            },
+            body: JSON.stringify(payload)
+          });
+
+          if (!response.ok) {
+            throw new Error(`伺服器錯誤 (HTTP ${response.status})`);
+          }
+
+          const result = await response.json();
+
+          if (result && result.status === 'success') {
+            triggerNotification('success', '✨ 一鍵同步成功！已為您安全備份至雲端。');
+          } else {
+            setCustomAlert({
+              title: "❌ 雲端同步失敗",
+              message: result ? result.message : "雲端試算表未回應成功狀態，請確認設定。"
+            });
+            triggerNotification('error', '雲端同步驗證失敗！');
+          }
+        } catch (error) {
+          console.error(error);
+          setCustomAlert({
+            title: "❌ 雲端連接失敗",
+            message: `上傳時發生錯誤：${error.message}。請確認：\n1. 您的 Google 部署網址是否正確。\n2. 部署時是否設定為「所有人 (Anyone)」均可存取。\n3. 您在 GAS 程式碼中是否設定了正確的密鑰。`
+          });
+          triggerNotification('error', '雲端同步失敗。');
+        } finally {
+          setSyncLoading(false);
+        }
+      };
+
+      // 2. 從 Google Sheets 下載歷史紀錄
+      const handleCloudImport = async () => {
+        if (!gasUrl) {
+          setCustomAlert({
+            title: "尚未設定雲端網址",
+            message: "請前往「雲端安全設定」分頁，貼上您的 Google Apps Script 部署網址再進行同步。"
+          });
+          return;
+        }
+
+        if (!securityKey || securityKey.trim() === "") {
+          setCustomAlert({
+            title: "⚠️ 安全防護：密鑰不可空白",
+            message: "欲從雲端取得資料，請先在左側填入您對應的安全密鑰，以進行身分解密。"
+          });
+          return;
+        }
+
+        setCustomConfirm({
+          message: "確定要從雲端還原資料嗎？這將會覆蓋您目前瀏覽器上的紀錄（建議先將現有紀錄進行匯出備份）。",
+          onConfirm: async () => {
+            setSyncLoading(true);
+            triggerNotification('info', '正在驗證安全密鑰並從雲端讀取紀錄...');
+            try {
+              const trimmedKey = securityKey.trim();
+              const fetchUrl = `${gasUrl}?key=${encodeURIComponent(trimmedKey)}`;
+              
+              const response = await fetch(fetchUrl);
+              if (!response.ok) {
+                throw new Error(`伺服器回應異常 (HTTP ${response.status})`);
+              }
+              
+              const cloudData = await response.json();
+              
+              if (cloudData && cloudData.status === 'error') {
+                setCustomAlert({
+                  title: "❌ 雲端驗證失敗",
+                  message: cloudData.message
+                });
+                triggerNotification('error', '驗證不通過，存取被拒。');
+                return;
+              }
+              
+              if (Array.isArray(cloudData)) {
+                if (cloudData.length === 0) {
+                  triggerNotification('info', '雲端試算表目前為空，無可還原資料。');
+                } else {
+                  setRecords(cloudData);
+                  triggerNotification('success', `✨ 還原成功！已載入 ${cloudData.length} 筆歷史紀錄。`);
+                }
+              } else {
+                triggerNotification('error', '格式不符，請確認安全密鑰是否正確。');
+              }
+            } catch (error) {
+              console.error(error);
+              setCustomAlert({
+                title: "❌ 讀取失敗",
+                message: `連線時發生錯誤：${error.message}。\n請確認：\n1. 您的「自訂安全密鑰（密碼）」是否與 Google Apps Script 中設定的完全一致。\n2. 您在 Apps Script 編輯程式碼後，是否有執行「建立新版本」並重新部署。`
+              });
+              triggerNotification('error', '讀取失敗。');
+            } finally {
+              setSyncLoading(false);
+              setCustomConfirm(null);
+            }
+          }
+        });
+      };
+
+      // ----------------------------------------------------
+      // 日期快速預設處理
+      // ----------------------------------------------------
+      const handlePresetChange = (preset) => {
+        setDatePreset(preset);
+        const end = new Date().toISOString().split('T')[0];
+        setEndDate(end);
+        
+        const start = new Date();
+        if (preset === '7days') {
+          start.setDate(start.getDate() - 6);
+          setStartDate(start.toISOString().split('T')[0]);
+        } else if (preset === '14days') {
+          start.setDate(start.getDate() - 13);
+          setStartDate(start.toISOString().split('T')[0]);
+        } else if (preset === '30days') {
+          start.setDate(start.getDate() - 29);
+          setStartDate(start.toISOString().split('T')[0]);
+        } else if (preset === '90days') {
+          start.setDate(start.getDate() - 89);
+          setStartDate(start.toISOString().split('T')[0]);
+        } else if (preset === 'all') {
+          if (records.length > 0) {
+            const sorted = [...records].sort((a, b) => new Date(a.date) - new Date(b.date));
+            setStartDate(sorted[0].date);
+          } else {
+            start.setDate(start.getDate() - 30);
+            setStartDate(start.toISOString().split('T')[0]);
+          }
+        }
+      };
+
+      // ----------------------------------------------------
+      // 數據過濾與排序
+      // ----------------------------------------------------
+      const filteredRecords = useMemo(() => {
+        let result = records.filter(r => {
+          const isWithinDate = r.date >= startDate && r.date <= endDate;
+          const isWithinPeriod = filterPeriod === 'all' || r.period === filterPeriod;
+          return isWithinDate && isWithinPeriod;
+        });
+
+        return result.sort((a, b) => {
+          if (a.date !== b.date) {
+            return new Date(a.date) - new Date(b.date);
+          }
+          return a.period === 'morning' ? -1 : 1;
+        });
+      }, [records, startDate, endDate, filterPeriod]);
+
+      // 依「日期」分組的數據
+      const groupedChartData = useMemo(() => {
+        const groups = {};
+        filteredRecords.forEach(r => {
+          if (!groups[r.date]) {
+            groups[r.date] = { date: r.date, morning: null, evening: null };
+          }
+          if (r.period === 'morning') {
+            groups[r.date].morning = r;
+          } else if (r.period === 'evening') {
+            groups[r.date].evening = r;
+          }
+        });
+        return Object.values(groups).sort((a, b) => new Date(a.date) - new Date(b.date));
+      }, [filteredRecords]);
+
+      // ----------------------------------------------------
+      // 量測值統計分析
+      // ----------------------------------------------------
+      const stats = useMemo(() => {
+        const result = {
+          mornSysAvg: 0, mornDiaAvg: 0, mornPulseAvg: 0, mornCount: 0,
+          evenSysAvg: 0, evenDiaAvg: 0, evenPulseAvg: 0, evenCount: 0,
+          totalSysAvg: 0, totalDiaAvg: 0, totalPulseAvg: 0, totalCount: 0,
+        };
+
+        let mSys = 0, mDia = 0, mPulse = 0;
+        let eSys = 0, eDia = 0, ePulse = 0;
+        
+        filteredRecords.forEach(r => {
+          if (r.period === 'morning') {
+            mSys += r.avgSystolic;
+            mDia += r.avgDiastolic;
+            mPulse += r.avgPulse;
+            result.mornCount++;
+          } else {
+            eSys += r.avgSystolic;
+            eDia += r.avgDiastolic;
+            ePulse += r.avgPulse;
+            result.evenCount++;
+          }
+        });
+
+        result.totalCount = result.mornCount + result.evenCount;
+
+        if (result.mornCount > 0) {
+          result.mornSysAvg = Math.round(mSys / result.mornCount);
+          result.mornDiaAvg = Math.round(mDia / result.mornCount);
+          result.mornPulseAvg = Math.round(mPulse / result.mornCount);
+        }
+        if (result.evenCount > 0) {
+          result.evenSysAvg = Math.round(eSys / result.evenCount);
+          result.evenDiaAvg = Math.round(eDia / result.evenCount);
+          result.evenPulseAvg = Math.round(ePulse / result.evenCount);
+        }
+        if (result.totalCount > 0) {
+          result.totalSysAvg = Math.round((mSys + eSys) / result.totalCount);
+          result.totalDiaAvg = Math.round((mDia + eDia) / result.totalCount);
+          result.totalPulseAvg = Math.round((mPulse + ePulse) / result.totalCount);
+        }
+
+        return result;
+      }, [filteredRecords]);
+
+      // ----------------------------------------------------
+      // 新增/修改表單操作
+      // ----------------------------------------------------
+      const openAddModal = () => {
+        setEditId(null);
+        setFormDate(new Date().toISOString().split('T')[0]);
+        const hour = new Date().getHours();
+        setFormPeriod(hour < 12 ? 'morning' : 'evening');
+        setFormReadings([{ systolic: 120, diastolic: 80, pulse: 70 }]);
+        setShowModal(true);
+      };
+
+      const openEditModal = (record) => {
+        setEditId(record.id);
+        setFormDate(record.date);
+        setFormPeriod(record.period);
+        setFormReadings(record.readings.map(r => ({ ...r })));
+        setShowModal(true);
+      };
+
+      const handleAddReadingField = () => {
+        const lastReading = formReadings[formReadings.length - 1] || { systolic: 120, diastolic: 80, pulse: 70 };
+        setFormReadings([...formReadings, { ...lastReading }]);
+      };
+
+      const handleRemoveReadingField = (index) => {
+        if (formReadings.length === 1) return;
+        setFormReadings(formReadings.filter((_, i) => i !== index));
+      };
+
+      const handleReadingChange = (index, field, value) => {
+        const updated = [...formReadings];
+        updated[index][field] = value === '' ? '' : parseInt(value, 10);
+        setFormReadings(updated);
+      };
+
+      const saveRecord = (e) => {
+        e.preventDefault();
+        
+        const validReadings = formReadings.map(r => ({
+          systolic: typeof r.systolic === 'number' && !isNaN(r.systolic) ? r.systolic : 120,
+          diastolic: typeof r.diastolic === 'number' && !isNaN(r.diastolic) ? r.diastolic : 80,
+          pulse: typeof r.pulse === 'number' && !isNaN(r.pulse) ? r.pulse : 70
+        }));
+
+        const count = validReadings.length;
+        const avgSystolic = Math.round(validReadings.reduce((sum, r) => sum + r.systolic, 0) / count);
+        const avgDiastolic = Math.round(validReadings.reduce((sum, r) => sum + r.diastolic, 0) / count);
+        const avgPulse = Math.round(validReadings.reduce((sum, r) => sum + r.pulse, 0) / count);
+
+        const newRecord = {
+          id: editId || `${formDate}-${formPeriod}`,
+          date: formDate,
+          period: formPeriod,
+          readings: validReadings,
+          avgSystolic,
+          avgDiastolic,
+          avgPulse
+        };
+
+        if (editId) {
+          setRecords(records.map(r => r.id === editId ? newRecord : r));
+          triggerNotification('success', '量測紀錄更新成功！');
+        } else {
+          const existsIndex = records.findIndex(r => r.date === formDate && r.period === formPeriod);
+          if (existsIndex > -1) {
+            setCustomConfirm({
+              message: `您已記錄過 ${formDate} 的 ${formPeriod === 'morning' ? '早上' : '晚上'} 量測，要覆蓋舊紀錄嗎？`,
+              onConfirm: () => {
+                const updated = [...records];
+                updated[existsIndex] = newRecord;
+                setRecords(updated);
+                setCustomConfirm(null);
+                triggerNotification('success', '已覆蓋並更新今日紀錄！');
+              }
+            });
+          } else {
+            setRecords([newRecord, ...records]);
+            triggerNotification('success', '新增量測成功！');
+          }
+        }
+        setShowModal(false);
+      };
+
+      const handleDeleteRecord = (id) => {
+        setCustomConfirm({
+          message: '確定要刪除這筆量測紀錄嗎？這只會先變更本機資料，建議刪除後再次手動一鍵同步至雲端。',
+          onConfirm: () => {
+            setRecords(records.filter(r => r.id !== id));
+            setCustomConfirm(null);
+            triggerNotification('success', '紀錄已刪除。');
+          }
+        });
+      };
+
+      const currentFormAvg = useMemo(() => {
+        const nums = formReadings.filter(r => typeof r.systolic === 'number' && typeof r.diastolic === 'number' && typeof r.pulse === 'number');
+        if (nums.length === 0) return { sys: 0, dia: 0, pulse: 0 };
+        return {
+          sys: Math.round(nums.reduce((sum, r) => sum + r.systolic, 0) / nums.length),
+          dia: Math.round(nums.reduce((sum, r) => sum + r.diastolic, 0) / nums.length),
+          pulse: Math.round(nums.reduce((sum, r) => sum + r.pulse, 0) / nums.length)
+        };
+      }, [formReadings]);
+
+      // ----------------------------------------------------
+      // SVG 線條繪圖算法 (精準自主渲染)
+      // ----------------------------------------------------
+      const renderSVGChart = (type) => {
+        if (groupedChartData.length === 0) {
+          return (
+            <div className="h-64 flex flex-col items-center justify-center text-slate-400 bg-slate-50 rounded-xl border border-dashed border-slate-200">
+              <svg className="w-12 h-12 mb-2 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+              </svg>
+              <span className="text-sm">此時間範圍內無篩選資料</span>
+            </div>
+          );
+        }
+
+        const paddingLeft = 50;
+        const paddingRight = 30;
+        const paddingTop = 20;
+        const paddingBottom = 45;
+        const width = 800;
+        const height = 300;
+        
+        const chartWidth = width - paddingLeft - paddingRight;
+        const chartHeight = height - paddingTop - paddingBottom;
+
+        let minVal = 40;
+        let maxVal = 180;
+        let yTicks = [];
+
+        if (type === 'bp') {
+          minVal = 50;
+          maxVal = 170;
+          yTicks = [60, 80, 100, 120, 140, 160];
+        } else {
+          minVal = 40;
+          maxVal = 130;
+          yTicks = [50, 70, 90, 110, 130];
+        }
+
+        const getX = (index) => {
+          if (groupedChartData.length <= 1) return paddingLeft + chartWidth / 2;
+          return paddingLeft + (index / (groupedChartData.length - 1)) * chartWidth;
+        };
+
+        const getY = (val) => {
+          if (val === null || val === undefined) return null;
+          return paddingTop + chartHeight - ((val - minVal) / (maxVal - minVal)) * chartHeight;
+        };
+
+        const generatePath = (key, subKey) => {
+          const points = [];
+          groupedChartData.forEach((d, idx) => {
+            const item = d[key];
+            if (item) {
+              const val = item[subKey];
+              const x = getX(idx);
+              const y = getY(val);
+              if (y !== null) {
+                points.push({ x, y });
+              }
+            }
+          });
+          if (points.length === 0) return '';
+          return points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ');
+        };
+
+        return (
+          <div className="relative overflow-x-auto">
+            <svg viewBox={`0 0 ${width} ${height}`} className="w-full min-w-[650px] h-auto select-none">
+              {yTicks.map(tick => {
+                const y = getY(tick);
+                return (
+                  <g key={tick} className="opacity-40">
+                    <line x1={paddingLeft} y1={y} x2={width - paddingRight} y2={y} stroke="#e2e8f0" strokeDasharray="4 4" strokeWidth="1" />
+                    <text x={paddingLeft - 10} y={y + 4} textAnchor="end" className="text-[10px] fill-slate-400 font-medium">{tick}</text>
+                  </g>
+                );
+              })}
+
+              {hoveredIndex !== null && (
+                <line 
+                  x1={getX(hoveredIndex)} 
+                  y1={paddingTop} 
+                  x2={getX(hoveredIndex)} 
+                  y2={height - paddingBottom} 
+                  stroke="#cbd5e1" 
+                  strokeWidth="1.5" 
+                  strokeDasharray="2 2"
+                />
+              )}
+
+              {groupedChartData.map((d, idx) => {
+                const x = getX(idx);
+                const interval = Math.ceil(groupedChartData.length / 8);
+                const showLabel = idx % interval === 0 || idx === groupedChartData.length - 1;
+                const dateObj = new Date(d.date);
+                const formattedDate = `${dateObj.getMonth() + 1}/${dateObj.getDate()}`;
+
+                return (
+                  <g key={d.date}>
+                    {showLabel && (
+                      <text x={x} y={height - paddingBottom + 18} textAnchor="middle" className="text-[10px] fill-slate-500 font-medium">
+                        {formattedDate}
+                      </text>
+                    )}
+                    <rect
+                      x={x - (chartWidth / Math.max(1, groupedChartData.length - 1)) / 2}
+                      y={paddingTop}
+                      width={chartWidth / Math.max(1, groupedChartData.length - 1)}
+                      height={chartHeight}
+                      fill="transparent"
+                      className="cursor-pointer"
+                      onMouseEnter={() => setHoveredIndex(idx)}
+                      onMouseLeave={() => setHoveredIndex(null)}
+                    />
+                  </g>
+                );
+              })}
+
+              {type === 'bp' ? (
+                <>
+                  {(filterPeriod === 'all' || filterPeriod === 'morning') && (
+                    <>
+                      <path d={generatePath('morning', 'avgSystolic')} fill="none" stroke="#f43f5e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                      {groupedChartData.map((d, idx) => {
+                        const y = getY(d.morning?.avgSystolic);
+                        return y !== null ? (
+                          <circle key={`m-sys-${idx}`} cx={getX(idx)} cy={y} r={hoveredIndex === idx ? 6 : 4} fill="#f43f5e" stroke="#ffffff" strokeWidth="1.5" />
+                        ) : null;
+                      })}
+                    </>
+                  )}
+                  {(filterPeriod === 'all' || filterPeriod === 'morning') && (
+                    <>
+                      <path d={generatePath('morning', 'avgDiastolic')} fill="none" stroke="#3b82f6" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                      {groupedChartData.map((d, idx) => {
+                        const y = getY(d.morning?.avgDiastolic);
+                        return y !== null ? (
+                          <circle key={`m-dia-${idx}`} cx={getX(idx)} cy={y} r={hoveredIndex === idx ? 6 : 4} fill="#3b82f6" stroke="#ffffff" strokeWidth="1.5" />
+                        ) : null;
+                      })}
+                    </>
+                  )}
+                  {(filterPeriod === 'all' || filterPeriod === 'evening') && (
+                    <>
+                      <path d={generatePath('evening', 'avgSystolic')} fill="none" stroke="#9f1239" strokeWidth="2" strokeDasharray="5 3" strokeLinecap="round" strokeLinejoin="round" />
+                      {groupedChartData.map((d, idx) => {
+                        const y = getY(d.evening?.avgSystolic);
+                        return y !== null ? (
+                          <circle key={`e-sys-${idx}`} cx={getX(idx)} cy={y} r={hoveredIndex === idx ? 6 : 4} fill="#9f1239" stroke="#ffffff" strokeWidth="1.5" />
+                        ) : null;
+                      })}
+                    </>
+                  )}
+                  {(filterPeriod === 'all' || filterPeriod === 'evening') && (
+                    <>
+                      <path d={generatePath('evening', 'avgDiastolic')} fill="none" stroke="#1d4ed8" strokeWidth="2" strokeDasharray="5 3" strokeLinecap="round" strokeLinejoin="round" />
+                      {groupedChartData.map((d, idx) => {
+                        const y = getY(d.evening?.avgDiastolic);
+                        return y !== null ? (
+                          <circle key={`e-dia-${idx}`} cx={getX(idx)} cy={y} r={hoveredIndex === idx ? 6 : 4} fill="#1d4ed8" stroke="#ffffff" strokeWidth="1.5" />
+                        ) : null;
+                      })}
+                    </>
+                  )}
+                </>
+              ) : (
+                <>
+                  {(filterPeriod === 'all' || filterPeriod === 'morning') && (
+                    <>
+                      <path d={generatePath('morning', 'avgPulse')} fill="none" stroke="#ec4899" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                      {groupedChartData.map((d, idx) => {
+                        const y = getY(d.morning?.avgPulse);
+                        return y !== null ? (
+                          <circle key={`m-pulse-${idx}`} cx={getX(idx)} cy={y} r={hoveredIndex === idx ? 6 : 4} fill="#ec4899" stroke="#ffffff" strokeWidth="1.5" />
+                        ) : null;
+                      })}
+                    </>
+                  )}
+                  {(filterPeriod === 'all' || filterPeriod === 'evening') && (
+                    <>
+                      <path d={generatePath('evening', 'avgPulse')} fill="none" stroke="#8b5cf6" strokeWidth="2" strokeDasharray="5 3" strokeLinecap="round" strokeLinejoin="round" />
+                      {groupedChartData.map((d, idx) => {
+                        const y = getY(d.evening?.avgPulse);
+                        return y !== null ? (
+                          <circle key={`e-pulse-${idx}`} cx={getX(idx)} cy={y} r={hoveredIndex === idx ? 6 : 4} fill="#8b5cf6" stroke="#ffffff" strokeWidth="1.5" />
+                        ) : null;
+                      })}
+                    </>
+                  )}
+                </>
+              )}
+            </svg>
+
+            <div className="flex flex-wrap items-center justify-center gap-6 mt-2 text-xs text-slate-600">
+              {type === 'bp' ? (
+                <>
+                  {(filterPeriod === 'all' || filterPeriod === 'morning') && (
+                    <>
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-3.5 h-1 bg-[#f43f5e] rounded-full inline-block"></span>
+                        <span>早上高壓 (平均)</span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-3.5 h-1 bg-[#3b82f6] rounded-full inline-block"></span>
+                        <span>早上低壓 (平均)</span>
+                      </div>
+                    </>
+                  )}
+                  {(filterPeriod === 'all' || filterPeriod === 'evening') && (
+                    <>
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-3.5 h-1 border-t-2 border-dashed border-[#9f1239] w-4 inline-block"></span>
+                        <span>晚上高壓 (平均)</span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-3.5 h-1 border-t-2 border-dashed border-[#1d4ed8] w-4 inline-block"></span>
+                        <span>晚上低壓 (平均)</span>
+                      </div>
+                    </>
+                  )}
+                </>
+              ) : (
+                <>
+                  {(filterPeriod === 'all' || filterPeriod === 'morning') && (
+                    <div className="flex items-center gap-1.5">
+                      <span className="w-3.5 h-1 bg-[#ec4899] rounded-full inline-block"></span>
+                      <span>早上心率 (平均)</span>
+                    </div>
+                  )}
+                  {(filterPeriod === 'all' || filterPeriod === 'evening') && (
+                    <div className="flex items-center gap-1.5">
+                      <span className="w-3.5 h-1 border-t-2 border-dashed border-[#8b5cf6] w-4 inline-block"></span>
+                      <span>晚上心率 (平均)</span>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        );
+      };
+
+      return (
+        <div className="min-h-screen bg-slate-50 text-slate-800 font-sans antialiased">
+          {notification && (
+            <div className={`fixed top-4 left-1/2 transform -translate-x-1/2 z-50 px-6 py-3 rounded-full shadow-xl text-xs font-bold transition-all duration-300 flex items-center gap-2 border ${
+              notification.type === 'success' ? 'bg-emerald-500 text-white border-emerald-400' :
+              notification.type === 'error' ? 'bg-rose-500 text-white border-rose-400' :
+              'bg-slate-900 text-white border-slate-800'
+            }`}>
+              {syncLoading && (
+                <svg className="animate-spin h-3.5 w-3.5 text-white mr-1" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                </svg>
+              )}
+              {notification.text}
+            </div>
+          )}
+
+          <header className="bg-white border-b border-slate-100 shadow-sm sticky top-0 z-30">
+            <div className="max-w-6xl mx-auto px-4 py-4 flex flex-col sm:flex-row items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 bg-rose-500 rounded-2xl text-white shadow-md shadow-rose-100">
+                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z" />
+                  </svg>
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h1 className="text-xl font-bold tracking-tight text-slate-900">血壓心率健康紀錄管理工具</h1>
+                    {gasUrl ? (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-600 border border-emerald-200">
+                        <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-ping"></span>
+                        雲端安全同步中
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-blue-50 text-blue-600 border border-blue-200">
+                        <span className="w-1.5 h-1.5 bg-blue-500 rounded-full"></span>
+                        瀏覽器本地儲存中
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-500 font-medium">支援每日多次量測平均、趨勢分析與自訂密鑰安全同步</p>
+                </div>
+              </div>
+              
+              <div className="flex items-center bg-slate-100 p-1 rounded-xl">
+                <button 
+                  onClick={() => setActiveTab('dashboard')}
+                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-all duration-200 ${activeTab === 'dashboard' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                >
+                  健康儀表板
+                </button>
+                <button 
+                  onClick={() => setActiveTab('history')}
+                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-all duration-200 ${activeTab === 'history' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                >
+                  詳細紀錄
+                </button>
+                <button 
+                  onClick={() => setActiveTab('cloud')}
+                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-all duration-200 ${activeTab === 'cloud' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                >
+                  🔒 雲端安全設定
+                </button>
+                <button 
+                  onClick={() => setActiveTab('guide')}
+                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-all duration-200 ${activeTab === 'guide' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                >
+                  指南
+                </button>
+              </div>
+            </div>
+          </header>
+
+          <main className="max-w-6xl mx-auto px-4 py-6">
+            {gasUrl && (
+              <div className="bg-slate-900 text-white rounded-2xl p-4 mb-6 flex flex-col md:flex-row items-center justify-between gap-3 shadow-md">
+                <div className="flex items-center gap-2 text-xs">
+                  <svg className="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                  </svg>
+                  <div>
+                    <span className="font-extrabold text-slate-200 block">雲端密鑰同步快捷列</span>
+                    <span className="text-slate-400">目前本地有 <strong className="text-white">{records.length}</strong> 筆數據可供上傳或覆蓋。</span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 w-full md:w-auto">
+                  <button
+                    onClick={handleCloudImport}
+                    disabled={syncLoading}
+                    className="flex-1 md:flex-none px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:bg-slate-800 text-xs font-bold rounded-lg transition-colors flex items-center justify-center gap-1.5"
+                  >
+                    📥 從雲端解密下載
+                  </button>
+                  <button
+                    onClick={handleCloudExport}
+                    disabled={syncLoading}
+                    className="flex-1 md:flex-none px-4 py-2 bg-rose-500 hover:bg-rose-600 disabled:bg-rose-400 text-xs font-bold rounded-lg transition-colors flex items-center justify-center gap-1.5 shadow-md"
+                  >
+                    📤 加密上傳至試算表
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {activeTab !== 'cloud' && (
+              <section className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 mb-6">
+                <div className="flex flex-col gap-4">
+                  <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4 border-b border-slate-100 pb-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-bold text-slate-400 tracking-wider uppercase mr-2">時間範圍:</span>
+                      {['7days', '14days', '30days', '90days', 'all'].map(preset => (
+                        <button 
+                          key={preset}
+                          onClick={() => handlePresetChange(preset)}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold border ${datePreset === preset ? 'bg-slate-900 text-white border-slate-900 shadow-sm' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}
+                        >
+                          {preset === '7days' && '近 7 天'}
+                          {preset === '14days' && '近 14 天'}
+                          {preset === '30days' && '近 30 天'}
+                          {preset === '90days' && '近 3 個月'}
+                          {preset === 'all' && '全部'}
+                        </button>
+                      ))}
+                    </div>
+
+                    <button 
+                      onClick={openAddModal}
+                      className="w-full lg:w-auto flex items-center justify-center gap-2 px-5 py-2.5 bg-rose-500 hover:bg-rose-600 text-white font-bold text-sm rounded-xl shadow-lg transition-all"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v16m8-8H4" />
+                      </svg>
+                      新增本日量測
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-bold text-slate-500">自訂日期範圍</label>
+                      <div className="flex items-center gap-2">
+                        <input 
+                          type="date" 
+                          value={startDate}
+                          onChange={(e) => {
+                            setStartDate(e.target.value);
+                            setDatePreset('custom');
+                          }}
+                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-700"
+                        />
+                        <span className="text-slate-400 text-xs">至</span>
+                        <input 
+                          type="date" 
+                          value={endDate}
+                          onChange={(e) => {
+                            setEndDate(e.target.value);
+                            setDatePreset('custom');
+                          }}
+                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-700"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-bold text-slate-500">量測時段</label>
+                      <select 
+                        value={filterPeriod}
+                        onChange={(e) => setFilterPeriod(e.target.value)}
+                        className="bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-700 focus:outline-none"
+                      >
+                        <option value="all">早上與晚上 (全部)</option>
+                        <option value="morning">僅早上量測</option>
+                        <option value="evening">僅晚上量測</option>
+                      </select>
+                    </div>
+
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-bold text-slate-500">圖表顯示指標</label>
+                      <div className="flex bg-slate-100 p-1 rounded-lg">
+                        {['all', 'bp', 'hr'].map(metric => (
+                          <button 
+                            key={metric}
+                            onClick={() => setFilterMetric(metric)}
+                            className={`flex-1 text-center py-1 rounded-md text-xs font-bold transition-all ${filterMetric === metric ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}
+                          >
+                            {metric === 'all' && '全部指標'}
+                            {metric === 'bp' && '僅血壓'}
+                            {metric === 'hr' && '僅心率'}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            )}
+
+            {activeTab === 'dashboard' && (
+              <div className="space-y-6">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {(filterPeriod === 'all' || filterPeriod === 'morning') && (
+                    <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+                      <div className="flex items-center justify-between mb-4">
+                        <span className="flex items-center gap-2 text-sm font-bold text-slate-700">
+                          <span className="p-1 bg-amber-50 text-amber-500 rounded-lg">🌞</span>
+                          早上平均紀錄
+                        </span>
+                        <span className="text-xs bg-slate-100 px-2 py-0.5 rounded text-slate-500 font-bold">{stats.mornCount} 天</span>
+                      </div>
+                      {stats.mornCount > 0 ? (
+                        <div className="space-y-3">
+                          <div>
+                            <div className="text-xs text-slate-400 font-medium mb-0.5">平均收縮壓/舒張壓</div>
+                            <div className="flex items-baseline gap-1">
+                              <span className="text-2xl font-black tracking-tight text-slate-800">{stats.mornSysAvg}</span>
+                              <span className="text-lg font-bold text-slate-400">/</span>
+                              <span className="text-2xl font-black tracking-tight text-slate-800">{stats.mornDiaAvg}</span>
+                              <span className="text-xs text-slate-400 font-bold ml-1.5">mmHg</span>
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-between border-t border-slate-50 pt-2.5">
+                            <div>
+                              <div className="text-xs text-slate-400 font-medium">平均心率</div>
+                              <div className="flex items-baseline gap-1">
+                                <span className="text-xl font-extrabold text-slate-800">{stats.mornPulseAvg}</span>
+                                <span className="text-xs text-slate-400 font-bold">bpm</span>
+                              </div>
+                            </div>
+                            <span className={`text-xs px-2.5 py-1 rounded-full border font-bold ${getBPLevel(stats.mornSysAvg, stats.mornDiaAvg).color}`}>
+                              {getBPLevel(stats.mornSysAvg, stats.mornDiaAvg).label}
+                            </span>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="text-sm text-slate-400 py-6 text-center font-medium">無早上紀錄</div>
+                      )}
+                    </div>
+                  )}
+
+                  {(filterPeriod === 'all' || filterPeriod === 'evening') && (
+                    <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+                      <div className="flex items-center justify-between mb-4">
+                        <span className="flex items-center gap-2 text-sm font-bold text-slate-700">
+                          <span className="p-1 bg-indigo-50 text-indigo-500 rounded-lg">🌙</span>
+                          晚上平均紀錄
+                        </span>
+                        <span className="text-xs bg-slate-100 px-2 py-0.5 rounded text-slate-500 font-bold">{stats.evenCount} 天</span>
+                      </div>
+                      {stats.evenCount > 0 ? (
+                        <div className="space-y-3">
+                          <div>
+                            <div className="text-xs text-slate-400 font-medium mb-0.5">平均收縮壓/舒張壓</div>
+                            <div className="flex items-baseline gap-1">
+                              <span className="text-2xl font-black tracking-tight text-slate-800">{stats.evenSysAvg}</span>
+                              <span className="text-lg font-bold text-slate-400">/</span>
+                              <span className="text-2xl font-black tracking-tight text-slate-800">{stats.evenDiaAvg}</span>
+                              <span className="text-xs text-slate-400 font-bold ml-1.5">mmHg</span>
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-between border-t border-slate-50 pt-2.5">
+                            <div>
+                              <div className="text-xs text-slate-400 font-medium">平均心率</div>
+                              <div className="flex items-baseline gap-1">
+                                <span className="text-xl font-extrabold text-slate-800">{stats.evenPulseAvg}</span>
+                                <span className="text-xs text-slate-400 font-bold">bpm</span>
+                              </div>
+                            </div>
+                            <span className={`text-xs px-2.5 py-1 rounded-full border font-bold ${getBPLevel(stats.evenSysAvg, stats.evenDiaAvg).color}`}>
+                              {getBPLevel(stats.evenSysAvg, stats.evenDiaAvg).label}
+                            </span>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="text-sm text-slate-400 py-6 text-center font-medium">無晚上紀錄</div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm sm:col-span-2 lg:col-span-1">
+                    <div className="flex items-center justify-between mb-4">
+                      <span className="flex items-center gap-2 text-sm font-bold text-slate-700">
+                        <span className="p-1 bg-emerald-50 text-emerald-500 rounded-lg">❤️</span>
+                        此區間綜合統計
+                      </span>
+                    </div>
+                    {stats.totalCount > 0 ? (
+                      <div className="space-y-3">
+                        <div>
+                          <div className="text-xs text-slate-400 font-medium mb-0.5">區間總體血壓均值</div>
+                          <div className="flex items-baseline gap-1">
+                            <span className="text-2xl font-black tracking-tight text-slate-800">{stats.totalSysAvg}</span>
+                            <span className="text-lg font-bold text-slate-400">/</span>
+                            <span className="text-2xl font-black tracking-tight text-slate-800">{stats.totalDiaAvg}</span>
+                            <span className="text-xs text-slate-400 font-bold ml-1.5">mmHg</span>
+                          </div>
+                        </div>
+                        <div className="flex items-center justify-between border-t border-slate-50 pt-2.5">
+                          <div>
+                            <div className="text-xs text-slate-400 font-medium">綜合平均心率</div>
+                            <div className="flex items-baseline gap-1">
+                              <span className="text-xl font-extrabold text-slate-800">{stats.totalPulseAvg}</span>
+                              <span className="text-xs text-slate-400 font-bold">bpm</span>
+                            </div>
+                          </div>
+                          <span className={`text-xs px-2.5 py-1 rounded-full border font-bold ${getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).color}`}>
+                            {getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label}
+                          </span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-sm text-slate-400 py-6 text-center font-medium">請在上方篩選或新增資料</div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 gap-6">
+                  <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm relative">
+                    <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 mb-6 border-b border-slate-50 pb-4">
+                      <div>
+                        <h3 className="text-lg font-black text-slate-900 flex items-center gap-2">
+                          📈 血壓與心率趨勢圖表
+                        </h3>
+                        <p className="text-xs text-slate-400 mt-0.5">顯示每日早/晚多次量測所得之「平均值」變化。將滑鼠移至點上以瀏覽各點細節。</p>
+                      </div>
+                      {hoveredIndex !== null && groupedChartData[hoveredIndex] && (
+                        <div className="bg-slate-900 text-white rounded-xl px-3 py-1.5 text-xs font-bold flex items-center gap-2">
+                          📅 <span>日期: {groupedChartData[hoveredIndex].date}</span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="space-y-8">
+                      {(filterMetric === 'all' || filterMetric === 'bp') && (
+                        <div>
+                          <h4 className="text-sm font-extrabold text-slate-700 mb-4 pl-2 border-l-4 border-rose-500 flex items-center justify-between">
+                            <span>收縮壓與舒張壓變化 (mmHg)</span>
+                            {hoveredIndex !== null && groupedChartData[hoveredIndex] && (
+                              <span className="text-xs font-normal text-slate-500">
+                                {groupedChartData[hoveredIndex].morning && `早：${groupedChartData[hoveredIndex].morning.avgSystolic}/${groupedChartData[hoveredIndex].morning.avgDiastolic}`}
+                                {groupedChartData[hoveredIndex].morning && groupedChartData[hoveredIndex].evening && ' | '}
+                                {groupedChartData[hoveredIndex].evening && `晚：${groupedChartData[hoveredIndex].evening.avgSystolic}/${groupedChartData[hoveredIndex].evening.avgDiastolic}`}
+                              </span>
+                            )}
+                          </h4>
+                          {renderSVGChart('bp')}
+                        </div>
+                      )}
+
+                      {(filterMetric === 'all' || filterMetric === 'hr') && (
+                        <div className="border-t border-slate-100 pt-6">
+                          <h4 className="text-sm font-extrabold text-slate-700 mb-4 pl-2 border-l-4 border-pink-500 flex items-center justify-between">
+                            <span>平均心率 (bpm)</span>
+                            {hoveredIndex !== null && groupedChartData[hoveredIndex] && (
+                              <span className="text-xs font-normal text-slate-500">
+                                {groupedChartData[hoveredIndex].morning && `早：${groupedChartData[hoveredIndex].morning.avgPulse}`}
+                                {groupedChartData[hoveredIndex].morning && groupedChartData[hoveredIndex].evening && ' | '}
+                                {groupedChartData[hoveredIndex].evening && `晚：${groupedChartData[hoveredIndex].evening.avgPulse}`}
+                              </span>
+                            )}
+                          </h4>
+                          {renderSVGChart('hr')}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+                      <h3 className="text-sm font-black text-slate-900 mb-3 flex items-center gap-2">
+                        💡 健康分析叮嚀 (依當前平均值計算)
+                      </h3>
+                      {stats.totalCount > 0 ? (
+                        <div className="space-y-3 text-xs leading-relaxed text-slate-600">
+                          {getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label === '正常血壓' && (
+                            <p className="bg-emerald-50 text-emerald-800 p-3 rounded-xl border border-emerald-100">
+                              🎉 <strong>表現極其優秀！</strong> 您的平均血壓非常理想。請繼續保持低鈉飲食、放鬆心情並規律量測。
+                            </p>
+                          )}
+                          {getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label === '血壓偏高' && (
+                            <p className="bg-yellow-50 text-yellow-800 p-3 rounded-xl border border-yellow-100">
+                              ⚠️ <strong>您的血壓已處於偏高臨界：</strong> 收縮壓為 120-129 mmHg。請開始重視少鹽清淡飲食、釋放壓力、充足睡眠。
+                            </p>
+                          )}
+                          {(getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label === '一期高血壓' || getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label === '二期高血壓') && (
+                            <p className="bg-amber-50 text-amber-800 p-3 rounded-xl border border-amber-100">
+                              🚨 <strong>血壓已達高血壓警示區：</strong> 您的量測平均值符合臨床高血壓。建議您記錄下完整的早晚數據，並前往家庭醫學科或心臟內科諮詢專業診斷與協助。
+                            </p>
+                          )}
+                          {getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label === '高血壓危機' && (
+                            <p className="bg-red-50 text-red-800 p-3 rounded-xl border border-red-100 font-medium">
+                              🛑 <strong>【高血壓危機！】</strong> 如果您量測高壓大於 180 mmHg 且感覺頭暈、胸悶或不舒服，請立即尋求緊急醫療協助！
+                            </p>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="text-xs text-slate-400 py-8 text-center">暫無足夠量測數據以供分析。</div>
+                      )}
+                    </div>
+
+                    <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm flex flex-col justify-between">
+                      <div>
+                        <h3 className="text-sm font-black text-slate-900 mb-2 flex items-center gap-2">
+                          🔒 雲端密鑰儲存與安全同步
+                        </h3>
+                        <p className="text-xs leading-relaxed text-slate-500">
+                          您的所有資料目前預設安全備份在**本機瀏覽器中**。
+                        </p>
+                        <p className="text-xs leading-relaxed text-slate-500 mt-2">
+                          為了加強安全性，我們已新增了**「安全密鑰」**功能。您可以在試算表與本小工具中設定一組相同的密鑰，只有在密鑰完全符合時才能同步下載與備份，阻擋任何惡意攔截與寫入。
+                        </p>
+                      </div>
+                      <div className="mt-4 pt-3 border-t border-slate-50 flex items-center justify-between text-xs font-bold text-slate-500">
+                        <span>前往設定安全保護</span>
+                        <button onClick={() => setActiveTab('cloud')} className="text-rose-500 hover:underline flex items-center gap-1">
+                          設定密鑰密碼 ➔
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'history' && (
+              <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-6 border-b border-slate-50 pb-4">
+                  <div>
+                    <h3 className="text-lg font-black text-slate-900">血壓與心率歷史紀錄表</h3>
+                    <p className="text-xs text-slate-400 mt-0.5">展開折疊面板可檢視每日多次量測的個別原始值。</p>
+                  </div>
+                  <div className="text-xs font-bold text-slate-500 bg-slate-100 px-3 py-1.5 rounded-lg self-start">
+                    目前篩選結果共：<span className="text-rose-500 font-extrabold">{filteredRecords.length}</span> 筆
+                  </div>
+                </div>
+
+                {filteredRecords.length > 0 ? (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse min-w-[600px]">
+                      <thead>
+                        <tr className="border-b border-slate-100 text-slate-400 text-xs font-bold uppercase tracking-wider">
+                          <th className="py-3 px-4">日期 / 時段</th>
+                          <th className="py-3 px-4">平均血壓 (mmHg)</th>
+                          <th className="py-3 px-4">平均心率 (bpm)</th>
+                          <th className="py-3 px-4">量測次數 ($n$)</th>
+                          <th className="py-3 px-4">血壓分級狀態</th>
+                          <th className="py-3 px-4 text-right">操作項目</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-50">
+                        {filteredRecords.map((r) => {
+                          const bpEval = getBPLevel(r.avgSystolic, r.avgDiastolic);
+                          return (
+                            <tr key={r.id} className="hover:bg-slate-50/50 transition-colors duration-150">
+                              <td className="py-4 px-4">
+                                <div className="flex items-center gap-2">
+                                  {r.period === 'morning' ? (
+                                    <span className="p-1 bg-amber-50 text-amber-500 rounded text-xs">🌞</span>
+                                  ) : (
+                                    <span className="p-1 bg-indigo-50 text-indigo-500 rounded text-xs">🌙</span>
+                                  )}
+                                  <div>
+                                    <span className="font-extrabold text-sm text-slate-800">{r.date}</span>
+                                    <span className="text-[10px] text-slate-400 font-bold block">
+                                      {r.period === 'morning' ? '早上測量' : '晚上測量'}
+                                    </span>
+                                  </div>
+                                </div>
+                              </td>
+                              <td className="py-4 px-4 font-black text-sm text-slate-800">
+                                {r.avgSystolic} <span className="text-slate-300 font-normal">/</span> {r.avgDiastolic}
+                                <span className="text-[10px] text-slate-400 font-bold block mt-0.5">mmHg</span>
+                              </td>
+                              <td className="py-4 px-4 font-extrabold text-sm text-slate-800">
+                                {r.avgPulse}
+                                <span className="text-[10px] text-slate-400 font-bold block mt-0.5">bpm</span>
+                              </td>
+                              <td className="py-4 px-4 text-xs">
+                                <details className="cursor-pointer group">
+                                  <summary className="text-slate-500 font-semibold hover:text-slate-950 flex items-center gap-1 focus:outline-none">
+                                    共量測 {r.readings.length} 次
+                                    <svg className="w-3 h-3 transform group-open:rotate-180 transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" />
+                                    </svg>
+                                  </summary>
+                                  <div className="mt-2 bg-slate-50 p-2.5 rounded-lg border border-slate-100 text-[10px] space-y-1 text-slate-500">
+                                    {r.readings.map((reading, idx) => (
+                                      <div key={idx} className="flex justify-between items-center py-0.5 border-b border-slate-100 last:border-0">
+                                        <span>第 {idx + 1} 次</span>
+                                        <span className="font-bold text-slate-700">
+                                          血壓: {reading.systolic}/{reading.diastolic} mmHg | 心跳: {reading.pulse} bpm
+                                        </span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </details>
+                              </td>
+                              <td className="py-4 px-4">
+                                <span className={`px-2 py-0.5 text-[10px] rounded-full border font-bold ${bpEval.color}`}>
+                                  {bpEval.label}
+                                </span>
+                              </td>
+                              <td className="py-4 px-4 text-right">
+                                <div className="flex items-center justify-end gap-1.5">
+                                  <button 
+                                    onClick={() => openEditModal(r)}
+                                    className="p-1.5 hover:bg-slate-100 rounded-lg text-slate-500 hover:text-slate-800"
+                                  >
+                                    ✏️
+                                  </button>
+                                  <button 
+                                    onClick={() => handleDeleteRecord(r.id)}
+                                    className="p-1.5 hover:bg-rose-50 rounded-lg text-rose-400 hover:text-rose-600"
+                                  >
+                                    🗑️
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <div className="text-center py-12 text-slate-400 font-medium">
+                    目前此篩選條件下沒有紀錄。請調整篩選日期或新增。
+                  </div>
+                )}
+              </div>
+            )}
+
+            {activeTab === 'cloud' && (
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-sm lg:col-span-1 space-y-5">
+                  <div>
+                    <h3 className="text-base font-black text-slate-900 flex items-center gap-1.5">
+                      🛡️ 1. 連接設定與加密認證
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-1">
+                      設定完成後，您可以將所有的數據安全保存於您的 Google Excel 試算表中。
+                    </p>
+                  </div>
+
+                  <div className="space-y-4">
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-bold text-slate-700">Google Apps Script 部署網址</label>
+                      <input 
+                        type="url" 
+                        placeholder="https://script.google.com/macros/s/.../exec"
+                        value={gasUrl}
+                        onChange={(e) => setGasUrl(e.target.value)}
+                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-xs font-semibold text-slate-700 focus:outline-none focus:ring-2 focus:ring-rose-500"
+                      />
+                    </div>
+
+                    <div className="flex flex-col gap-1.5">
+                      <div className="flex items-center justify-between">
+                        <label className="text-xs font-bold text-slate-700">設定自訂安全密鑰 (密碼)</label>
+                        <span className="text-[10px] bg-rose-50 text-rose-500 px-1.5 py-0.5 rounded font-bold">高安全性</span>
+                      </div>
+                      <input 
+                        type="password" 
+                        placeholder="請輸入一個您自訂的密碼"
+                        value={securityKey}
+                        onChange={(e) => setSecurityKey(e.target.value)}
+                        className={`w-full border rounded-xl px-3 py-2.5 text-xs font-semibold text-slate-700 focus:outline-none focus:ring-2 focus:ring-rose-500 ${
+                          !securityKey ? 'bg-rose-50/50 border-rose-300' : 'bg-slate-50 border-slate-200'
+                        }`}
+                      />
+                      {!securityKey && (
+                        <p className="text-[10px] text-rose-500 font-bold leading-normal animate-pulse">
+                          ⚠️ 密碼不可空白！當設定為空白時，系統將會主動阻擋雲端同步以維護隱私。
+                        </p>
+                      )}
+                      <p className="text-[10px] text-slate-400 leading-normal">
+                        * 此處密碼必須與您在試算表 Apps Script 最上方設定的 `SECURITY_KEY` **完全一致**。
+                      </p>
+                    </div>
+
+                    {gasUrl && (
+                      <div className="flex gap-2 pt-2">
+                        <button
+                          onClick={() => {
+                            setGasUrl('');
+                            setSecurityKey('');
+                            triggerNotification('info', '已關閉雲端，回到本機安全儲存。');
+                          }}
+                          className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-600 py-2 rounded-lg text-xs font-bold transition-all"
+                        >
+                          中斷安全連接
+                        </button>
+                        <button
+                          onClick={handleCloudExport}
+                          disabled={syncLoading}
+                          className="flex-1 bg-rose-500 hover:bg-rose-600 disabled:bg-rose-300 text-white py-2 rounded-lg text-xs font-bold transition-all shadow-sm"
+                        >
+                          {syncLoading ? '認證中...' : '測試上傳驗證'}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="border-t border-slate-50 pt-4 space-y-3">
+                    <span className="text-xs font-bold text-slate-700 block">現有本機資料控制</span>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => {
+                          setCustomConfirm({
+                            message: "確定要將本機數據『完全重設』為預設模擬資料嗎？這將會覆蓋您本機現有的紀錄！",
+                            onConfirm: () => {
+                              setRecords(generateMockData());
+                              setCustomConfirm(null);
+                              triggerNotification('success', '已成功還原為預設模擬資料。');
+                            }
+                          });
+                        }}
+                        className="flex-1 bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-600 py-2 rounded-lg text-[11px] font-semibold"
+                      >
+                        還原模擬資料
+                      </button>
+                      <button
+                        onClick={() => {
+                          setCustomConfirm({
+                            message: "確定要清空本機的所有資料嗎？清空後將無法復原（除非您已備份至雲端）。",
+                            onConfirm: () => {
+                              setRecords([]);
+                              setCustomConfirm(null);
+                              triggerNotification('success', '已清空本地所有量測資料。');
+                            }
+                          });
+                        }}
+                        className="flex-1 bg-rose-50 text-rose-600 border border-rose-100 hover:bg-rose-100 py-2 rounded-lg text-[11px] font-semibold"
+                      >
+                        清空本機紀錄
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-sm lg:col-span-2 space-y-4">
+                  <div>
+                    <h3 className="text-base font-black text-slate-900">2. 雲端密鑰驗證設定指南</h3>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      為了實現最強的自訂安全防護，您的 Apps Script 必須使用下方內含「安全密鑰驗證功能」的最新程式碼。
+                    </p>
+                  </div>
+
+                  <div className="space-y-4 text-xs text-slate-600 leading-relaxed">
+                    <div>
+                      <h4 className="font-extrabold text-slate-800 mb-1 flex items-center gap-1.5">
+                        <span className="w-4 h-4 bg-slate-900 text-white rounded-full flex items-center justify-center text-[10px]">1</span>
+                        複製並更新 Google Apps Script
+                      </h4>
+                      <p className="pl-5 mb-2 text-slate-500">
+                        請確認您的 GAS 程式碼最上方有設定與此處相同的密碼。
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'guide' && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+                  <div className="p-2 bg-rose-50 text-rose-500 rounded-xl w-fit mb-3">⏱️</div>
+                  <h3 className="font-bold text-slate-950 mb-2">步驟一：量測前準備</h3>
+                  <ul className="text-xs text-slate-600 space-y-2 list-disc list-inside">
+                    <li>量測前 30 分鐘內請勿飲用咖啡、茶、酒精、或吸菸及進行劇烈運動。</li>
+                    <li>排空尿液，憋尿會導致交感神經興奮，使血壓升高 10-15 mmHg。</li>
+                    <li>量測前在安靜的房間坐著放鬆 5 分鐘。</li>
+                  </ul>
+                </div>
+
+                <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+                  <div className="p-2 bg-blue-50 text-blue-500 rounded-xl w-fit mb-3">🩺</div>
+                  <h3 className="font-bold text-slate-950 mb-2">步驟二：正確姿勢與綁法</h3>
+                  <ul className="text-xs text-slate-600 space-y-2 list-disc list-inside">
+                    <li>挺直靠著椅背坐好，雙腳平放於地板上，請勿翹腳。</li>
+                    <li>手臂平放在桌上，確保袖帶中心高度與心臟在同一水平線上。</li>
+                  </ul>
+                </div>
+
+                <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+                  <div className="p-2 bg-amber-50 text-amber-500 rounded-xl w-fit mb-3">🗓️</div>
+                  <h3 className="font-bold text-slate-950 mb-2">步驟三：黃金測量時間 722</h3>
+                  <ul className="text-xs text-slate-600 space-y-2 list-disc list-inside">
+                    <li>台灣高血壓學會推薦「722法則」：</li>
+                    <li><strong>7</strong>：連續量測 7 天。</li>
+                    <li><strong>2</strong>：每天量 2 回（早上、晚上）。</li>
+                  </ul>
+                </div>
+              </div>
+            )}
+          </main>
+
+          {showModal && (
+            <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
+              <div className="bg-white rounded-3xl w-full max-w-lg shadow-2xl border border-slate-100 overflow-hidden transform transition-all">
+                <div className="px-6 py-4 bg-slate-900 text-white flex items-center justify-between">
+                  <div>
+                    <h3 className="text-base font-extrabold">{editId ? '修改量測紀錄' : '新增量測紀錄'}</h3>
+                    <p className="text-[10px] text-slate-400 mt-0.5">早上或晚上量測 $n$ 次，自動計算該時段平均值</p>
+                  </div>
+                  <button onClick={() => setShowModal(false)} className="p-1 text-slate-400 hover:text-white">✕</button>
+                </div>
+
+                <form onSubmit={saveRecord} className="p-6 space-y-4">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-bold text-slate-600">量測日期</label>
+                      <input 
+                        type="date" 
+                        value={formDate}
+                        onChange={(e) => setFormDate(e.target.value)}
+                        required
+                        className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-sm font-semibold text-slate-700"
+                      />
+                    </div>
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-bold text-slate-600">量測時段</label>
+                      <div className="grid grid-cols-2 bg-slate-100 p-1 rounded-xl">
+                        <button
+                          type="button"
+                          onClick={() => setFormPeriod('morning')}
+                          className={`py-1.5 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1 ${formPeriod === 'morning' ? 'bg-white text-amber-500 shadow-sm' : 'text-slate-500'}`}
+                        >
+                          🌞 早上
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setFormPeriod('evening')}
+                          className={`py-1.5 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1 ${formPeriod === 'evening' ? 'bg-white text-indigo-500 shadow-sm' : 'text-slate-500'}`}
+                        >
+                          🌙 晚上
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="border-t border-slate-100 pt-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-slate-600">量測數據 (可新增多次取平均值)</span>
+                      <button type="button" onClick={handleAddReadingField} className="text-xs text-rose-500 hover:text-rose-600 font-bold">＋ 新增一次量測</button>
+                    </div>
+
+                    <div className="max-h-56 overflow-y-auto pr-1 space-y-3">
+                      {formReadings.map((reading, index) => (
+                        <div key={index} className="bg-slate-50 border border-slate-100 rounded-2xl p-3 relative flex items-center gap-3">
+                          <span className="text-xs font-black text-slate-400 bg-slate-200/50 w-5 h-5 rounded-full flex items-center justify-center shrink-0">
+                            {index + 1}
+                          </span>
+
+                          <div className="grid grid-cols-3 gap-2 flex-1">
+                            <div className="flex flex-col gap-1">
+                              <span className="text-[10px] font-bold text-slate-500 text-center">收縮壓 (高壓)</span>
+                              <input 
+                                type="number" required min="50" max="250"
+                                value={reading.systolic}
+                                onChange={(e) => handleReadingChange(index, 'systolic', e.target.value)}
+                                className="bg-white border border-slate-200 rounded-lg py-1 px-2 text-center text-sm font-bold text-slate-800"
+                              />
+                            </div>
+                            <div className="flex flex-col gap-1">
+                              <span className="text-[10px] font-bold text-slate-500 text-center">舒張壓 (低壓)</span>
+                              <input 
+                                type="number" required min="30" max="150"
+                                value={reading.diastolic}
+                                onChange={(e) => handleReadingChange(index, 'diastolic', e.target.value)}
+                                className="bg-white border border-slate-200 rounded-lg py-1 px-2 text-center text-sm font-bold text-slate-800"
+                              />
+                            </div>
+                            <div className="flex flex-col gap-1">
+                              <span className="text-[10px] font-bold text-slate-500 text-center">心率 (心跳)</span>
+                              <input 
+                                type="number" required min="30" max="200"
+                                value={reading.pulse}
+                                onChange={(e) => handleReadingChange(index, 'pulse', e.target.value)}
+                                className="bg-white border border-slate-200 rounded-lg py-1 px-2 text-center text-sm font-bold text-slate-800"
+                              />
+                            </div>
+                          </div>
+
+                          {formReadings.length > 1 && (
+                            <button type="button" onClick={() => handleRemoveReadingField(index)} className="text-rose-400 hover:text-rose-600">🗑️</button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="bg-rose-50/50 rounded-2xl p-4 border border-rose-100 flex items-center justify-between">
+                    <div>
+                      <h4 className="text-xs font-extrabold text-slate-700">本次量測平均結果 ($n={formReadings.length}$)</h4>
+                      <p className="text-[10px] text-slate-400 mt-0.5">儲存後系統將自動將平均值繪製進趨勢圖</p>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-sm font-black text-slate-800">
+                        {currentFormAvg.sys} / {currentFormAvg.dia} <span className="text-xs text-slate-400 font-bold">mmHg</span>
+                      </div>
+                      <div className="text-xs font-bold text-slate-500 mt-0.5">
+                        心率: {currentFormAvg.pulse} <span className="text-[10px]">bpm</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex gap-3 pt-2">
+                    <button type="button" onClick={() => setShowModal(false)} className="flex-1 bg-slate-100 text-slate-600 py-2.5 rounded-xl font-bold">取消</button>
+                    <button type="submit" className="flex-1 bg-rose-500 text-white py-2.5 rounded-xl font-bold shadow-lg shadow-rose-100">儲存並計算平均</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {customConfirm && (
+            <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
+              <div className="bg-white rounded-2xl w-full max-w-sm p-6 shadow-xl border border-slate-100 space-y-4">
+                <h4 className="text-sm font-black text-slate-900">確認您的操作</h4>
+                <p className="text-xs text-slate-500 leading-relaxed">{customConfirm.message}</p>
+                <div className="flex gap-2">
+                  <button onClick={() => setCustomConfirm(null)} className="flex-1 bg-slate-100 text-slate-600 py-2 rounded-lg text-xs font-bold">取消</button>
+                  <button onClick={customConfirm.onConfirm} className="flex-1 bg-rose-500 text-white py-2 rounded-lg text-xs font-bold">確定</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {customAlert && (
+            <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
+              <div className="bg-white rounded-2xl w-full max-w-sm p-6 shadow-xl border border-slate-100 space-y-4">
+                <h4 className="text-sm font-black text-slate-900 flex items-center gap-1.5 text-rose-500">⚠️ {customAlert.title}</h4>
+                <p className="text-xs text-slate-500 leading-relaxed">{customAlert.message}</p>
+                <button onClick={() => setCustomAlert(null)} className="w-full bg-slate-900 text-white py-2 rounded-lg text-xs font-bold">我知道了</button>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // 將 React 元件掛載到網頁中
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
