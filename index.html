@@ -14,6 +14,10 @@
   
   <!-- 載入 Babel (用於在瀏覽器中即時解析 JSX 語法) -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- 載入 PDF 導出專用核心庫 (html2canvas & jsPDF) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 </head>
 <body class="bg-slate-50">
   <div id="root"></div>
@@ -87,7 +91,7 @@
 
     function App() {
       // ----------------------------------------------------
-      // 狀態管理 (雙驅動儲存：LocalStorage 優先)
+      // 狀態管理 (LocalStorage 優先)
       // ----------------------------------------------------
       const [records, setRecords] = useState(() => {
         const local = localStorage.getItem('bp_tracker_records_v2');
@@ -98,19 +102,20 @@
         return localStorage.getItem('bp_tracker_gas_url') || '';
       });
 
-      // 安全密鑰狀態 (自訂驗證密碼)
       const [securityKey, setSecurityKey] = useState(() => {
         return localStorage.getItem('bp_tracker_security_key') || '';
       });
 
       // UI 與同步狀態
-      const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'history' | 'cloud' | 'guide'
+      const [activeTab, setActiveTab] = useState('dashboard');
       const [syncLoading, setSyncLoading] = useState(false);
       const [notification, setNotification] = useState(null); // { type: 'success'|'error'|'info', text: string }
       
-      // 自訂對話框/確認框
       const [customConfirm, setCustomConfirm] = useState(null); 
       const [customAlert, setCustomAlert] = useState(null); 
+
+      // 詳細紀錄「日期/時段」預設排序：預設 'desc' (由新到舊)
+      const [sortOrder, setSortOrder] = useState('desc'); 
 
       // 篩選器狀態
       const [datePreset, setDatePreset] = useState('14days');
@@ -152,9 +157,6 @@
         localStorage.setItem('bp_tracker_security_key', securityKey);
       }, [securityKey]);
 
-      // ----------------------------------------------------
-      // 通知提示框自動關閉
-      // ----------------------------------------------------
       const triggerNotification = (type, text) => {
         setNotification({ type, text });
         setTimeout(() => {
@@ -163,11 +165,9 @@
       };
 
       // ----------------------------------------------------
-      // GOOGLE SHEET 雲端同步核心 API
+      // 核心功能：差異增量合併同步處理
       // ----------------------------------------------------
-      
-      // 1. 匯出當前全部紀錄至 Google Sheets
-      const handleCloudExport = async () => {
+      const handleCloudSync = async () => {
         if (!gasUrl) {
           setCustomAlert({
             title: "尚未設定雲端網址",
@@ -185,155 +185,180 @@
         }
 
         setSyncLoading(true);
-        triggerNotification('info', '正在將資料加密上傳至 Google 試算表...');
+        triggerNotification('info', '正在比對本地與雲端數據差異...');
 
         try {
           const trimmedKey = securityKey.trim();
 
-          const payload = {
-            action: 'saveAll',
-            key: trimmedKey, 
-            records: records
-          };
+          // 1. 先從雲端抓取目前的完整資料
+          const fetchUrl = `${gasUrl}?key=${encodeURIComponent(trimmedKey)}`;
+          const response = await fetch(fetchUrl);
+          
+          if (!response.ok) {
+            throw new Error(`雲端連線失敗 (HTTP ${response.status})`);
+          }
+          
+          const cloudData = await response.json();
+          
+          if (cloudData && cloudData.status === 'error') {
+            setCustomAlert({
+              title: "❌ 雲端驗證失敗",
+              message: cloudData.message
+            });
+            triggerNotification('error', '驗證不通過，存取被拒。');
+            setSyncLoading(false);
+            return;
+          }
 
-          const response = await fetch(gasUrl, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'text/plain;charset=utf-8',
-            },
-            body: JSON.stringify(payload)
+          const remoteRecords = Array.isArray(cloudData) ? cloudData : [];
+          const remoteMap = new Map(remoteRecords.map(r => [r.id, r]));
+          const localMap = new Map(records.map(r => [r.id, r]));
+
+          // 找出「本地需要同步到雲端」的變動/新增數據
+          const localChanges = [];
+          records.forEach(localRec => {
+            const remoteRec = remoteMap.get(localRec.id);
+            if (!remoteRec || JSON.stringify(localRec.readings) !== JSON.stringify(remoteRec.readings)) {
+              localChanges.push(localRec);
+            }
           });
 
-          if (!response.ok) {
-            throw new Error(`伺服器錯誤 (HTTP ${response.status})`);
-          }
+          // 找出「雲端存在但本地遺失」的外部更新數據
+          const cloudOnlyRecords = [];
+          remoteRecords.forEach(remoteRec => {
+            if (!localMap.has(remoteRec.id)) {
+              cloudOnlyRecords.push(remoteRec);
+            }
+          });
 
-          const result = await response.json();
+          let updatedRecordsList = [...records];
+          let updatedInCloud = 0;
 
-          if (result && result.status === 'success') {
-            triggerNotification('success', '✨ 一鍵同步成功！已為您安全備份至雲端。');
-          } else {
-            setCustomAlert({
-              title: "❌ 雲端同步失敗",
-              message: result ? result.message : "雲端試算表未回應成功狀態，請確認設定。"
+          // 2. 如果本地有更新，採用「增量式」提交變更
+          if (localChanges.length > 0) {
+            triggerNotification('info', `正在增量上傳 ${localChanges.length} 筆變更數據至試算表...`);
+            
+            const payload = {
+              action: 'upsertRecords',
+              key: trimmedKey,
+              records: localChanges
+            };
+
+            const postResponse = await fetch(gasUrl, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'text/plain;charset=utf-8',
+              },
+              body: JSON.stringify(payload)
             });
-            triggerNotification('error', '雲端同步驗證失敗！');
+
+            if (!postResponse.ok) {
+              throw new Error(`上傳差異失敗 (HTTP ${postResponse.status})`);
+            }
+
+            const postResult = await postResponse.json();
+            if (postResult && postResult.status === 'success') {
+              updatedInCloud = localChanges.length;
+            } else {
+              throw new Error(postResult ? postResult.message : '雲端寫入異常');
+            }
           }
+
+          // 3. 合併雲端獨有資料回本地
+          if (cloudOnlyRecords.length > 0) {
+            updatedRecordsList = [...cloudOnlyRecords, ...updatedRecordsList];
+          }
+
+          // 更新狀態
+          if (localChanges.length > 0 || cloudOnlyRecords.length > 0) {
+            setRecords(updatedRecordsList);
+            triggerNotification('success', `✨ 智慧同步成功！雲端更新 ${updatedInCloud} 筆，本地下載合併 ${cloudOnlyRecords.length} 筆。`);
+          } else {
+            triggerNotification('success', '✨ 數據已是最新狀態，本地與雲端完全一致。');
+          }
+
         } catch (error) {
           console.error(error);
           setCustomAlert({
-            title: "❌ 雲端連接失敗",
-            message: `上傳時發生錯誤：${error.message}。請確認：\n1. 您的 Google 部署網址是否正確。\n2. 部署時是否設定為「所有人 (Anyone)」均可存取。\n3. 您在 GAS 程式碼中是否設定了正確的密鑰。`
+            title: "❌ 同步連線失敗",
+            message: `錯誤詳情：${error.message}。\n\n請前往「安全設定分頁」複製並部署最新的 Google Apps Script 增量腳本。`
           });
-          triggerNotification('error', '雲端同步失敗。');
+          triggerNotification('error', '差異同步失敗。');
         } finally {
           setSyncLoading(false);
         }
       };
 
-      // 2. 從 Google Sheets 下載歷史紀錄
-      const handleCloudImport = async () => {
-        if (!gasUrl) {
-          setCustomAlert({
-            title: "尚未設定雲端網址",
-            message: "請前往「雲端安全設定」分頁，貼上您的 Google Apps Script 部署網址再進行同步。"
-          });
-          return;
-        }
-
-        if (!securityKey || securityKey.trim() === "") {
-          setCustomAlert({
-            title: "⚠️ 安全防護：密鑰不可空白",
-            message: "欲從雲端取得資料，請先在左側填入您對應的安全密鑰，以進行身分解密。"
-          });
-          return;
-        }
-
+      // 覆蓋雲端 (強制整批覆蓋上傳)
+      const handleCloudExportAll = async () => {
         setCustomConfirm({
-          message: "確定要從雲端還原資料嗎？這將會覆蓋您目前瀏覽器上的紀錄（建議先將現有紀錄進行匯出備份）。",
+          message: "此為全覆蓋操作，會清除雲端試算表並整批重新上傳本地所有資料，確定要繼續嗎？",
           onConfirm: async () => {
+            setCustomConfirm(null);
             setSyncLoading(true);
-            triggerNotification('info', '正在驗證安全密鑰並從雲端讀取紀錄...');
+            triggerNotification('info', '正在全量覆蓋上傳雲端...');
+            try {
+              const trimmedKey = securityKey.trim();
+              const payload = {
+                action: 'saveAll',
+                key: trimmedKey, 
+                records: records
+              };
+              const response = await fetch(gasUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                body: JSON.stringify(payload)
+              });
+              const result = await response.json();
+              if (result && result.status === 'success') {
+                triggerNotification('success', '✨ 雲端試算表全量覆蓋備份成功！');
+              } else {
+                triggerNotification('error', '備份失敗');
+              }
+            } catch (err) {
+              triggerNotification('error', '連線失敗');
+            } finally {
+              setSyncLoading(false);
+            }
+          }
+        });
+      };
+
+      // 強制重載 (清除本地，下載雲端整張表)
+      const handleCloudImportAll = async () => {
+        setCustomConfirm({
+          message: "確定要清空本地資料，並從雲端強制重新下載全部紀錄嗎？",
+          onConfirm: async () => {
+            setCustomConfirm(null);
+            setSyncLoading(true);
             try {
               const trimmedKey = securityKey.trim();
               const fetchUrl = `${gasUrl}?key=${encodeURIComponent(trimmedKey)}`;
-              
               const response = await fetch(fetchUrl);
-              if (!response.ok) {
-                throw new Error(`伺服器回應異常 (HTTP ${response.status})`);
-              }
-              
               const cloudData = await response.json();
-              
-              if (cloudData && cloudData.status === 'error') {
-                setCustomAlert({
-                  title: "❌ 雲端驗證失敗",
-                  message: cloudData.message
-                });
-                triggerNotification('error', '驗證不通過，存取被拒。');
-                return;
-              }
-              
-              if (Array.isArray(cloudData)) {
-                if (cloudData.length === 0) {
-                  triggerNotification('info', '雲端試算表目前為空，無可還原資料。');
-                } else {
-                  setRecords(cloudData);
-                  triggerNotification('success', `✨ 還原成功！已載入 ${cloudData.length} 筆歷史紀錄。`);
-                }
+              if (cloudData && Array.isArray(cloudData)) {
+                setRecords(cloudData);
+                triggerNotification('success', '✨ 成功重新抓取並覆蓋本地全部紀錄！');
               } else {
-                triggerNotification('error', '格式不符，請確認安全密鑰是否正確。');
+                triggerNotification('error', '讀取失敗');
               }
-            } catch (error) {
-              console.error(error);
-              setCustomAlert({
-                title: "❌ 讀取失敗",
-                message: `連線時發生錯誤：${error.message}。\n請確認：\n1. 您的「自訂安全密鑰（密碼）」是否與 Google Apps Script 中設定的完全一致。\n2. 您在 Apps Script 編輯程式碼後，是否有執行「建立新版本」並重新部署。`
-              });
-              triggerNotification('error', '讀取失敗。');
+            } catch (e) {
+              triggerNotification('error', '下載失敗');
             } finally {
               setSyncLoading(false);
-              setCustomConfirm(null);
             }
           }
         });
       };
 
       // ----------------------------------------------------
-      // 日期快速預設處理
+      // 詳細紀錄「日期 / 時段」雙向排序控制
       // ----------------------------------------------------
-      const handlePresetChange = (preset) => {
-        setDatePreset(preset);
-        const end = new Date().toISOString().split('T')[0];
-        setEndDate(end);
-        
-        const start = new Date();
-        if (preset === '7days') {
-          start.setDate(start.getDate() - 6);
-          setStartDate(start.toISOString().split('T')[0]);
-        } else if (preset === '14days') {
-          start.setDate(start.getDate() - 13);
-          setStartDate(start.toISOString().split('T')[0]);
-        } else if (preset === '30days') {
-          start.setDate(start.getDate() - 29);
-          setStartDate(start.toISOString().split('T')[0]);
-        } else if (preset === '90days') {
-          start.setDate(start.getDate() - 89);
-          setStartDate(start.toISOString().split('T')[0]);
-        } else if (preset === 'all') {
-          if (records.length > 0) {
-            const sorted = [...records].sort((a, b) => new Date(a.date) - new Date(b.date));
-            setStartDate(sorted[0].date);
-          } else {
-            start.setDate(start.getDate() - 30);
-            setStartDate(start.toISOString().split('T')[0]);
-          }
-        }
+      const toggleSortOrder = () => {
+        setSortOrder(prev => prev === 'desc' ? 'asc' : 'desc');
+        triggerNotification('info', `已切換為 ${sortOrder === 'desc' ? '遞增排序 (舊到新)' : '遞減排序 (新到舊)'}`);
       };
 
-      // ----------------------------------------------------
-      // 數據過濾與排序
-      // ----------------------------------------------------
       const filteredRecords = useMemo(() => {
         let result = records.filter(r => {
           const isWithinDate = r.date >= startDate && r.date <= endDate;
@@ -342,14 +367,78 @@
         });
 
         return result.sort((a, b) => {
+          const dateA = new Date(a.date);
+          const dateB = new Date(b.date);
           if (a.date !== b.date) {
-            return new Date(a.date) - new Date(b.date);
+            return sortOrder === 'desc' ? dateB - dateA : dateA - dateB;
           }
-          return a.period === 'morning' ? -1 : 1;
+          // 同一天：降密排序時晚上(evening)在最上，升密排序時早上(morning)在最上
+          const periodOrder = sortOrder === 'desc'
+            ? (a.period === 'evening' ? -1 : 1)
+            : (a.period === 'morning' ? -1 : 1);
+          return periodOrder;
         });
-      }, [records, startDate, endDate, filterPeriod]);
+      }, [records, startDate, endDate, filterPeriod, sortOrder]);
 
-      // 依「日期」分組的數據
+      // ----------------------------------------------------
+      // A4 專業級 PDF 報告導出與格式化控制
+      // ----------------------------------------------------
+      const handleExportPDF = async () => {
+        setSyncLoading(true);
+        triggerNotification('info', '正在重構版面，準備產生 A4 行動健康診斷報告...');
+
+        // 顯示隱藏的 A4 專用渲染版塊
+        const pdfArea = document.getElementById('pdf-report-area');
+        pdfArea.classList.remove('hidden');
+
+        try {
+          // 給予短暫延遲，讓 SVG 及容器字體渲染完畢
+          await new Promise(resolve => setTimeout(resolve, 800));
+
+          const canvas = await html2canvas(pdfArea, {
+            scale: 2, // 雙倍超高畫質
+            useCORS: true,
+            allowTaint: true,
+            logging: false,
+            backgroundColor: '#ffffff'
+          });
+
+          const imgData = canvas.toDataURL('image/jpeg', 1.0);
+          const { jsPDF } = window.jspdf;
+          const pdf = new jsPDF('p', 'mm', 'a4');
+          
+          const imgWidth = 210;
+          const pageHeight = 297;
+          const imgHeight = (canvas.height * imgWidth) / canvas.width;
+          let heightLeft = imgHeight;
+          let position = 0;
+
+          // 繪製第一頁
+          pdf.addImage(imgData, 'JPEG', 0, position, imgWidth, imgHeight);
+          heightLeft -= pageHeight;
+
+          // 跨多頁自動精準切割貼上
+          while (heightLeft >= 0) {
+            position = heightLeft - imgHeight;
+            pdf.addPage();
+            pdf.addImage(imgData, 'JPEG', 0, position, imgWidth, imgHeight);
+            heightLeft -= pageHeight;
+          }
+
+          const filename = `血壓健康報告_${startDate}_至_${endDate}.pdf`;
+          pdf.save(filename);
+          triggerNotification('success', '🎉 精美 A4 PDF 健康報告已導出並下載！');
+
+        } catch (error) {
+          console.error(error);
+          triggerNotification('error', 'PDF 生成失敗，請確認是否安裝必要的外部庫或重試。');
+        } finally {
+          pdfArea.classList.add('hidden');
+          setSyncLoading(false);
+        }
+      };
+
+      // 依「日期」分組
       const groupedChartData = useMemo(() => {
         const groups = {};
         filteredRecords.forEach(r => {
@@ -365,9 +454,7 @@
         return Object.values(groups).sort((a, b) => new Date(a.date) - new Date(b.date));
       }, [filteredRecords]);
 
-      // ----------------------------------------------------
-      // 量測值統計分析
-      // ----------------------------------------------------
+      // 統計數據
       const stats = useMemo(() => {
         const result = {
           mornSysAvg: 0, mornDiaAvg: 0, mornPulseAvg: 0, mornCount: 0,
@@ -414,7 +501,7 @@
       }, [filteredRecords]);
 
       // ----------------------------------------------------
-      // 新增/修改表單操作
+      // 🔮 修正部分：補回遺漏的表單、模態視窗與數據刪改核心操作函數
       // ----------------------------------------------------
       const openAddModal = () => {
         setEditId(null);
@@ -519,15 +606,12 @@
       }, [formReadings]);
 
       // ----------------------------------------------------
-      // SVG 線條繪圖算法 (精準自主渲染)
+      // SVG 圖表繪製（已整合高壓120、低壓80與心率70的醒目參考對照線）
       // ----------------------------------------------------
-      const renderSVGChart = (type) => {
+      const renderSVGChart = (type, isForPDF = false) => {
         if (groupedChartData.length === 0) {
           return (
             <div className="h-64 flex flex-col items-center justify-center text-slate-400 bg-slate-50 rounded-xl border border-dashed border-slate-200">
-              <svg className="w-12 h-12 mb-2 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-              </svg>
               <span className="text-sm">此時間範圍內無篩選資料</span>
             </div>
           );
@@ -537,7 +621,7 @@
         const paddingRight = 30;
         const paddingTop = 20;
         const paddingBottom = 45;
-        const width = 800;
+        const width = isForPDF ? 1000 : 800; 
         const height = 300;
         
         const chartWidth = width - paddingLeft - paddingRight;
@@ -587,6 +671,8 @@
         return (
           <div className="relative overflow-x-auto">
             <svg viewBox={`0 0 ${width} ${height}`} className="w-full min-w-[650px] h-auto select-none">
+              
+              {/* 背景網格線 */}
               {yTicks.map(tick => {
                 const y = getY(tick);
                 return (
@@ -597,7 +683,30 @@
                 );
               })}
 
-              {hoveredIndex !== null && (
+              {/* 💡 醒目醫學標準參考對照線 (血壓與心跳) */}
+              {type === 'bp' ? (
+                <>
+                  {/* 收縮壓（高壓）120 mmHg 參考線 */}
+                  <g className="opacity-95">
+                    <line x1={paddingLeft} y1={getY(120)} x2={width - paddingRight} y2={getY(120)} stroke="#f43f5e" strokeDasharray="6 4" strokeWidth="1.5" />
+                    <text x={width - paddingRight - 10} y={getY(120) - 5} textAnchor="end" className="text-[9px] fill-rose-600 font-black tracking-wide">收縮壓標準 (120 mmHg)</text>
+                  </g>
+                  {/* 舒張壓（低壓）80 mmHg 參考線 */}
+                  <g className="opacity-95">
+                    <line x1={paddingLeft} y1={getY(80)} x2={width - paddingRight} y2={getY(80)} stroke="#2563eb" strokeDasharray="6 4" strokeWidth="1.5" />
+                    <text x={width - paddingRight - 10} y={getY(80) - 5} textAnchor="end" className="text-[9px] fill-blue-600 font-black tracking-wide">舒張壓標準 (80 mmHg)</text>
+                  </g>
+                </>
+              ) : (
+                /* 正常靜止心率 70 bpm 參考線 */
+                <g className="opacity-95">
+                  <line x1={paddingLeft} y1={getY(70)} x2={width - paddingRight} y2={getY(70)} stroke="#db2777" strokeDasharray="6 4" strokeWidth="1.5" />
+                  <text x={width - paddingRight - 10} y={getY(70) - 5} textAnchor="end" className="text-[9px] fill-pink-600 font-black tracking-wide">正常靜止心率參考 (70 bpm)</text>
+                </g>
+              )}
+
+              {/* 滑鼠 hover 對齊引導線 */}
+              {!isForPDF && hoveredIndex !== null && (
                 <line 
                   x1={getX(hoveredIndex)} 
                   y1={paddingTop} 
@@ -609,6 +718,7 @@
                 />
               )}
 
+              {/* 日期刻度與標籤 */}
               {groupedChartData.map((d, idx) => {
                 const x = getX(idx);
                 const interval = Math.ceil(groupedChartData.length / 8);
@@ -623,20 +733,23 @@
                         {formattedDate}
                       </text>
                     )}
-                    <rect
-                      x={x - (chartWidth / Math.max(1, groupedChartData.length - 1)) / 2}
-                      y={paddingTop}
-                      width={chartWidth / Math.max(1, groupedChartData.length - 1)}
-                      height={chartHeight}
-                      fill="transparent"
-                      className="cursor-pointer"
-                      onMouseEnter={() => setHoveredIndex(idx)}
-                      onMouseLeave={() => setHoveredIndex(null)}
-                    />
+                    {!isForPDF && (
+                      <rect
+                        x={x - (chartWidth / Math.max(1, groupedChartData.length - 1)) / 2}
+                        y={paddingTop}
+                        width={chartWidth / Math.max(1, groupedChartData.length - 1)}
+                        height={chartHeight}
+                        fill="transparent"
+                        className="cursor-pointer"
+                        onMouseEnter={() => setHoveredIndex(idx)}
+                        onMouseLeave={() => setHoveredIndex(null)}
+                      />
+                    )}
                   </g>
                 );
               })}
 
+              {/* 量測折線渲染 */}
               {type === 'bp' ? (
                 <>
                   {(filterPeriod === 'all' || filterPeriod === 'morning') && (
@@ -645,7 +758,7 @@
                       {groupedChartData.map((d, idx) => {
                         const y = getY(d.morning?.avgSystolic);
                         return y !== null ? (
-                          <circle key={`m-sys-${idx}`} cx={getX(idx)} cy={y} r={hoveredIndex === idx ? 6 : 4} fill="#f43f5e" stroke="#ffffff" strokeWidth="1.5" />
+                          <circle key={`m-sys-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#f43f5e" stroke="#ffffff" strokeWidth="1.5" />
                         ) : null;
                       })}
                     </>
@@ -656,7 +769,7 @@
                       {groupedChartData.map((d, idx) => {
                         const y = getY(d.morning?.avgDiastolic);
                         return y !== null ? (
-                          <circle key={`m-dia-${idx}`} cx={getX(idx)} cy={y} r={hoveredIndex === idx ? 6 : 4} fill="#3b82f6" stroke="#ffffff" strokeWidth="1.5" />
+                          <circle key={`m-dia-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#3b82f6" stroke="#ffffff" strokeWidth="1.5" />
                         ) : null;
                       })}
                     </>
@@ -667,7 +780,7 @@
                       {groupedChartData.map((d, idx) => {
                         const y = getY(d.evening?.avgSystolic);
                         return y !== null ? (
-                          <circle key={`e-sys-${idx}`} cx={getX(idx)} cy={y} r={hoveredIndex === idx ? 6 : 4} fill="#9f1239" stroke="#ffffff" strokeWidth="1.5" />
+                          <circle key={`e-sys-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#9f1239" stroke="#ffffff" strokeWidth="1.5" />
                         ) : null;
                       })}
                     </>
@@ -678,7 +791,7 @@
                       {groupedChartData.map((d, idx) => {
                         const y = getY(d.evening?.avgDiastolic);
                         return y !== null ? (
-                          <circle key={`e-dia-${idx}`} cx={getX(idx)} cy={y} r={hoveredIndex === idx ? 6 : 4} fill="#1d4ed8" stroke="#ffffff" strokeWidth="1.5" />
+                          <circle key={`e-dia-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#1d4ed8" stroke="#ffffff" strokeWidth="1.5" />
                         ) : null;
                       })}
                     </>
@@ -692,7 +805,7 @@
                       {groupedChartData.map((d, idx) => {
                         const y = getY(d.morning?.avgPulse);
                         return y !== null ? (
-                          <circle key={`m-pulse-${idx}`} cx={getX(idx)} cy={y} r={hoveredIndex === idx ? 6 : 4} fill="#ec4899" stroke="#ffffff" strokeWidth="1.5" />
+                          <circle key={`m-pulse-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#ec4899" stroke="#ffffff" strokeWidth="1.5" />
                         ) : null;
                       })}
                     </>
@@ -703,7 +816,7 @@
                       {groupedChartData.map((d, idx) => {
                         const y = getY(d.evening?.avgPulse);
                         return y !== null ? (
-                          <circle key={`e-pulse-${idx}`} cx={getX(idx)} cy={y} r={hoveredIndex === idx ? 6 : 4} fill="#8b5cf6" stroke="#ffffff" strokeWidth="1.5" />
+                          <circle key={`e-pulse-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#8b5cf6" stroke="#ffffff" strokeWidth="1.5" />
                         ) : null;
                       })}
                     </>
@@ -711,58 +824,43 @@
                 </>
               )}
             </svg>
-
-            <div className="flex flex-wrap items-center justify-center gap-6 mt-2 text-xs text-slate-600">
-              {type === 'bp' ? (
-                <>
-                  {(filterPeriod === 'all' || filterPeriod === 'morning') && (
-                    <>
-                      <div className="flex items-center gap-1.5">
-                        <span className="w-3.5 h-1 bg-[#f43f5e] rounded-full inline-block"></span>
-                        <span>早上高壓 (平均)</span>
-                      </div>
-                      <div className="flex items-center gap-1.5">
-                        <span className="w-3.5 h-1 bg-[#3b82f6] rounded-full inline-block"></span>
-                        <span>早上低壓 (平均)</span>
-                      </div>
-                    </>
-                  )}
-                  {(filterPeriod === 'all' || filterPeriod === 'evening') && (
-                    <>
-                      <div className="flex items-center gap-1.5">
-                        <span className="w-3.5 h-1 border-t-2 border-dashed border-[#9f1239] w-4 inline-block"></span>
-                        <span>晚上高壓 (平均)</span>
-                      </div>
-                      <div className="flex items-center gap-1.5">
-                        <span className="w-3.5 h-1 border-t-2 border-dashed border-[#1d4ed8] w-4 inline-block"></span>
-                        <span>晚上低壓 (平均)</span>
-                      </div>
-                    </>
-                  )}
-                </>
-              ) : (
-                <>
-                  {(filterPeriod === 'all' || filterPeriod === 'morning') && (
-                    <div className="flex items-center gap-1.5">
-                      <span className="w-3.5 h-1 bg-[#ec4899] rounded-full inline-block"></span>
-                      <span>早上心率 (平均)</span>
-                    </div>
-                  )}
-                  {(filterPeriod === 'all' || filterPeriod === 'evening') && (
-                    <div className="flex items-center gap-1.5">
-                      <span className="w-3.5 h-1 border-t-2 border-dashed border-[#8b5cf6] w-4 inline-block"></span>
-                      <span>晚上心率 (平均)</span>
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
           </div>
         );
       };
 
+      // 導出日期設定
+      const handlePresetChange = (preset) => {
+        setDatePreset(preset);
+        const end = new Date().toISOString().split('T')[0];
+        setEndDate(end);
+        
+        const start = new Date();
+        if (preset === '7days') {
+          start.setDate(start.getDate() - 6);
+          setStartDate(start.toISOString().split('T')[0]);
+        } else if (preset === '14days') {
+          start.setDate(start.getDate() - 13);
+          setStartDate(start.toISOString().split('T')[0]);
+        } else if (preset === '30days') {
+          start.setDate(start.getDate() - 29);
+          setStartDate(start.toISOString().split('T')[0]);
+        } else if (preset === '90days') {
+          start.setDate(start.getDate() - 89);
+          setStartDate(start.toISOString().split('T')[0]);
+        } else if (preset === 'all') {
+          if (records.length > 0) {
+            const sorted = [...records].sort((a, b) => new Date(a.date) - new Date(b.date));
+            setStartDate(sorted[0].date);
+          } else {
+            start.setDate(start.getDate() - 30);
+            setStartDate(start.toISOString().split('T')[0]);
+          }
+        }
+      };
+
       return (
         <div className="min-h-screen bg-slate-50 text-slate-800 font-sans antialiased">
+          {/* 頂部全域通知 */}
           {notification && (
             <div className={`fixed top-4 left-1/2 transform -translate-x-1/2 z-50 px-6 py-3 rounded-full shadow-xl text-xs font-bold transition-all duration-300 flex items-center gap-2 border ${
               notification.type === 'success' ? 'bg-emerald-500 text-white border-emerald-400' :
@@ -802,7 +900,7 @@
                       </span>
                     )}
                   </div>
-                  <p className="text-xs text-slate-500 font-medium">支援每日多次量測平均、趨勢分析與自訂密鑰安全同步</p>
+                  <p className="text-xs text-slate-500 font-medium">支援每日多次量測平均、趨勢分析與智慧增量加密同步</p>
                 </div>
               </div>
               
@@ -836,6 +934,7 @@
           </header>
 
           <main className="max-w-6xl mx-auto px-4 py-6">
+            
             {gasUrl && (
               <div className="bg-slate-900 text-white rounded-2xl p-4 mb-6 flex flex-col md:flex-row items-center justify-between gap-3 shadow-md">
                 <div className="flex items-center gap-2 text-xs">
@@ -843,24 +942,17 @@
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
                   </svg>
                   <div>
-                    <span className="font-extrabold text-slate-200 block">雲端密鑰同步快捷列</span>
-                    <span className="text-slate-400">目前本地有 <strong className="text-white">{records.length}</strong> 筆數據可供上傳或覆蓋。</span>
+                    <span className="font-extrabold text-slate-200 block">🛡️ 安全雙向差異同步 (智慧省流量模式)</span>
+                    <span className="text-slate-400">目前本地有 <strong className="text-white">{records.length}</strong> 筆數據。點選同步將只上傳或下載變動項。</span>
                   </div>
                 </div>
                 <div className="flex items-center gap-2 w-full md:w-auto">
                   <button
-                    onClick={handleCloudImport}
+                    onClick={handleCloudSync}
                     disabled={syncLoading}
-                    className="flex-1 md:flex-none px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:bg-slate-800 text-xs font-bold rounded-lg transition-colors flex items-center justify-center gap-1.5"
+                    className="w-full md:w-auto px-5 py-2.5 bg-rose-500 hover:bg-rose-600 disabled:bg-rose-400 text-xs font-bold rounded-xl transition-all flex items-center justify-center gap-1.5 shadow-lg shadow-rose-900/20"
                   >
-                    📥 從雲端解密下載
-                  </button>
-                  <button
-                    onClick={handleCloudExport}
-                    disabled={syncLoading}
-                    className="flex-1 md:flex-none px-4 py-2 bg-rose-500 hover:bg-rose-600 disabled:bg-rose-400 text-xs font-bold rounded-lg transition-colors flex items-center justify-center gap-1.5 shadow-md"
-                  >
-                    📤 加密上傳至試算表
+                    🔄 智慧差異同步
                   </button>
                 </div>
               </div>
@@ -887,15 +979,20 @@
                       ))}
                     </div>
 
-                    <button 
-                      onClick={openAddModal}
-                      className="w-full lg:w-auto flex items-center justify-center gap-2 px-5 py-2.5 bg-rose-500 hover:bg-rose-600 text-white font-bold text-sm rounded-xl shadow-lg transition-all"
-                    >
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v16m8-8H4" />
-                      </svg>
-                      新增本日量測
-                    </button>
+                    <div className="flex flex-col sm:flex-row gap-2 w-full lg:w-auto">
+                      <button 
+                        onClick={handleExportPDF}
+                        className="flex items-center justify-center gap-2 px-5 py-2.5 bg-slate-900 hover:bg-slate-800 text-white font-bold text-sm rounded-xl shadow-md transition-all"
+                      >
+                        📄 導出 PDF 報告
+                      </button>
+                      <button 
+                        onClick={openAddModal}
+                        className="flex items-center justify-center gap-2 px-5 py-2.5 bg-rose-500 hover:bg-rose-600 text-white font-bold text-sm rounded-xl shadow-lg shadow-rose-100 transition-all"
+                      >
+                        新增本日量測
+                      </button>
+                    </div>
                   </div>
 
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -944,7 +1041,12 @@
                           <button 
                             key={metric}
                             onClick={() => setFilterMetric(metric)}
-                            className={`flex-1 text-center py-1 rounded-md text-xs font-bold transition-all ${filterMetric === metric ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}
+                            className="flex-1 text-center py-1 rounded-md text-xs font-bold transition-all"
+                            style={{
+                              backgroundColor: filterMetric === metric ? 'white' : 'transparent',
+                              color: filterMetric === metric ? '#0f172a' : '#64748b',
+                              boxShadow: filterMetric === metric ? '0 1px 3px 0 rgba(0, 0, 0, 0.1)' : 'none'
+                            }}
                           >
                             {metric === 'all' && '全部指標'}
                             {metric === 'bp' && '僅血壓'}
@@ -1076,6 +1178,7 @@
                   </div>
                 </div>
 
+                {/* 圖表 */}
                 <div className="grid grid-cols-1 gap-6">
                   <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm relative">
                     <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 mb-6 border-b border-slate-50 pb-4">
@@ -1083,113 +1186,41 @@
                         <h3 className="text-lg font-black text-slate-900 flex items-center gap-2">
                           📈 血壓與心率趨勢圖表
                         </h3>
-                        <p className="text-xs text-slate-400 mt-0.5">顯示每日早/晚多次量測所得之「平均值」變化。將滑鼠移至點上以瀏覽各點細節。</p>
+                        <p className="text-xs text-slate-400 mt-0.5">顯示每日早/晚多次量測所得之「平均值」變化。</p>
                       </div>
-                      {hoveredIndex !== null && groupedChartData[hoveredIndex] && (
-                        <div className="bg-slate-900 text-white rounded-xl px-3 py-1.5 text-xs font-bold flex items-center gap-2">
-                          📅 <span>日期: {groupedChartData[hoveredIndex].date}</span>
-                        </div>
-                      )}
                     </div>
 
                     <div className="space-y-8">
                       {(filterMetric === 'all' || filterMetric === 'bp') && (
                         <div>
-                          <h4 className="text-sm font-extrabold text-slate-700 mb-4 pl-2 border-l-4 border-rose-500 flex items-center justify-between">
-                            <span>收縮壓與舒張壓變化 (mmHg)</span>
-                            {hoveredIndex !== null && groupedChartData[hoveredIndex] && (
-                              <span className="text-xs font-normal text-slate-500">
-                                {groupedChartData[hoveredIndex].morning && `早：${groupedChartData[hoveredIndex].morning.avgSystolic}/${groupedChartData[hoveredIndex].morning.avgDiastolic}`}
-                                {groupedChartData[hoveredIndex].morning && groupedChartData[hoveredIndex].evening && ' | '}
-                                {groupedChartData[hoveredIndex].evening && `晚：${groupedChartData[hoveredIndex].evening.avgSystolic}/${groupedChartData[hoveredIndex].evening.avgDiastolic}`}
-                              </span>
-                            )}
+                          <h4 className="text-sm font-extrabold text-slate-700 mb-4 pl-2 border-l-4 border-rose-500">
+                            收縮壓與舒張壓變化 (mmHg)
                           </h4>
-                          {renderSVGChart('bp')}
+                          {renderSVGChart('bp', false)}
                         </div>
                       )}
 
                       {(filterMetric === 'all' || filterMetric === 'hr') && (
                         <div className="border-t border-slate-100 pt-6">
-                          <h4 className="text-sm font-extrabold text-slate-700 mb-4 pl-2 border-l-4 border-pink-500 flex items-center justify-between">
-                            <span>平均心率 (bpm)</span>
-                            {hoveredIndex !== null && groupedChartData[hoveredIndex] && (
-                              <span className="text-xs font-normal text-slate-500">
-                                {groupedChartData[hoveredIndex].morning && `早：${groupedChartData[hoveredIndex].morning.avgPulse}`}
-                                {groupedChartData[hoveredIndex].morning && groupedChartData[hoveredIndex].evening && ' | '}
-                                {groupedChartData[hoveredIndex].evening && `晚：${groupedChartData[hoveredIndex].evening.avgPulse}`}
-                              </span>
-                            )}
+                          <h4 className="text-sm font-extrabold text-slate-700 mb-4 pl-2 border-l-4 border-pink-500">
+                            平均心率 (bpm)
                           </h4>
-                          {renderSVGChart('hr')}
+                          {renderSVGChart('hr', false)}
                         </div>
                       )}
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
-                      <h3 className="text-sm font-black text-slate-900 mb-3 flex items-center gap-2">
-                        💡 健康分析叮嚀 (依當前平均值計算)
-                      </h3>
-                      {stats.totalCount > 0 ? (
-                        <div className="space-y-3 text-xs leading-relaxed text-slate-600">
-                          {getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label === '正常血壓' && (
-                            <p className="bg-emerald-50 text-emerald-800 p-3 rounded-xl border border-emerald-100">
-                              🎉 <strong>表現極其優秀！</strong> 您的平均血壓非常理想。請繼續保持低鈉飲食、放鬆心情並規律量測。
-                            </p>
-                          )}
-                          {getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label === '血壓偏高' && (
-                            <p className="bg-yellow-50 text-yellow-800 p-3 rounded-xl border border-yellow-100">
-                              ⚠️ <strong>您的血壓已處於偏高臨界：</strong> 收縮壓為 120-129 mmHg。請開始重視少鹽清淡飲食、釋放壓力、充足睡眠。
-                            </p>
-                          )}
-                          {(getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label === '一期高血壓' || getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label === '二期高血壓') && (
-                            <p className="bg-amber-50 text-amber-800 p-3 rounded-xl border border-amber-100">
-                              🚨 <strong>血壓已達高血壓警示區：</strong> 您的量測平均值符合臨床高血壓。建議您記錄下完整的早晚數據，並前往家庭醫學科或心臟內科諮詢專業診斷與協助。
-                            </p>
-                          )}
-                          {getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label === '高血壓危機' && (
-                            <p className="bg-red-50 text-red-800 p-3 rounded-xl border border-red-100 font-medium">
-                              🛑 <strong>【高血壓危機！】</strong> 如果您量測高壓大於 180 mmHg 且感覺頭暈、胸悶或不舒服，請立即尋求緊急醫療協助！
-                            </p>
-                          )}
-                        </div>
-                      ) : (
-                        <div className="text-xs text-slate-400 py-8 text-center">暫無足夠量測數據以供分析。</div>
-                      )}
-                    </div>
-
-                    <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm flex flex-col justify-between">
-                      <div>
-                        <h3 className="text-sm font-black text-slate-900 mb-2 flex items-center gap-2">
-                          🔒 雲端密鑰儲存與安全同步
-                        </h3>
-                        <p className="text-xs leading-relaxed text-slate-500">
-                          您的所有資料目前預設安全備份在**本機瀏覽器中**。
-                        </p>
-                        <p className="text-xs leading-relaxed text-slate-500 mt-2">
-                          為了加強安全性，我們已新增了**「安全密鑰」**功能。您可以在試算表與本小工具中設定一組相同的密鑰，只有在密鑰完全符合時才能同步下載與備份，阻擋任何惡意攔截與寫入。
-                        </p>
-                      </div>
-                      <div className="mt-4 pt-3 border-t border-slate-50 flex items-center justify-between text-xs font-bold text-slate-500">
-                        <span>前往設定安全保護</span>
-                        <button onClick={() => setActiveTab('cloud')} className="text-rose-500 hover:underline flex items-center gap-1">
-                          設定密鑰密碼 ➔
-                        </button>
-                      </div>
                     </div>
                   </div>
                 </div>
               </div>
             )}
 
+            {/* ----------------- TAB: 詳細紀錄清單 ----------------- */}
             {activeTab === 'history' && (
               <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-6 border-b border-slate-50 pb-4">
                   <div>
                     <h3 className="text-lg font-black text-slate-900">血壓與心率歷史紀錄表</h3>
-                    <p className="text-xs text-slate-400 mt-0.5">展開折疊面板可檢視每日多次量測的個別原始值。</p>
+                    <p className="text-xs text-slate-400 mt-0.5">點擊「日期 / 時段」欄位標題，即可切換【新到舊】或【舊到新】排序！</p>
                   </div>
                   <div className="text-xs font-bold text-slate-500 bg-slate-100 px-3 py-1.5 rounded-lg self-start">
                     目前篩選結果共：<span className="text-rose-500 font-extrabold">{filteredRecords.length}</span> 筆
@@ -1201,7 +1232,14 @@
                     <table className="w-full text-left border-collapse min-w-[600px]">
                       <thead>
                         <tr className="border-b border-slate-100 text-slate-400 text-xs font-bold uppercase tracking-wider">
-                          <th className="py-3 px-4">日期 / 時段</th>
+                          <th className="py-3 px-4 cursor-pointer hover:bg-slate-50 transition-colors rounded-lg select-none" onClick={toggleSortOrder}>
+                            <div className="flex items-center gap-1.5">
+                              <span>日期 / 時段</span>
+                              <span className="text-slate-500 text-sm">
+                                {sortOrder === 'desc' ? '⬇️ (新→舊)' : '⬆️ (舊→新)'}
+                              </span>
+                            </div>
+                          </th>
                           <th className="py-3 px-4">平均血壓 (mmHg)</th>
                           <th className="py-3 px-4">平均心率 (bpm)</th>
                           <th className="py-3 px-4">量測次數 ($n$)</th>
@@ -1234,7 +1272,7 @@
                                 <span className="text-[10px] text-slate-400 font-bold block mt-0.5">mmHg</span>
                               </td>
                               <td className="py-4 px-4 font-extrabold text-sm text-slate-800">
-                                {r.avgPulse}
+                                {r.avgPulse || '--'}
                                 <span className="text-[10px] text-slate-400 font-bold block mt-0.5">bpm</span>
                               </td>
                               <td className="py-4 px-4 text-xs">
@@ -1250,7 +1288,7 @@
                                       <div key={idx} className="flex justify-between items-center py-0.5 border-b border-slate-100 last:border-0">
                                         <span>第 {idx + 1} 次</span>
                                         <span className="font-bold text-slate-700">
-                                          血壓: {reading.systolic}/{reading.diastolic} mmHg | 心跳: {reading.pulse} bpm
+                                          血壓: {reading.systolic}/{reading.diastolic} mmHg {reading.pulse ? `| 心跳: ${reading.pulse} bpm` : ''}
                                         </span>
                                       </div>
                                     ))}
@@ -1292,15 +1330,18 @@
               </div>
             )}
 
+            {/* ----------------- TAB: 雲端安全備份設定 ----------------- */}
             {activeTab === 'cloud' && (
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                
+                {/* 左側：設定控制面板 */}
                 <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-sm lg:col-span-1 space-y-5">
                   <div>
                     <h3 className="text-base font-black text-slate-900 flex items-center gap-1.5">
                       🛡️ 1. 連接設定與加密認證
                     </h3>
                     <p className="text-xs text-slate-400 mt-1">
-                      設定完成後，您可以將所有的數據安全保存於您的 Google Excel 試算表中。
+                      設定好試算表網址後，系統將自動啟動高能差異增量同步。
                     </p>
                   </div>
 
@@ -1317,48 +1358,42 @@
                     </div>
 
                     <div className="flex flex-col gap-1.5">
-                      <div className="flex items-center justify-between">
-                        <label className="text-xs font-bold text-slate-700">設定自訂安全密鑰 (密碼)</label>
-                        <span className="text-[10px] bg-rose-50 text-rose-500 px-1.5 py-0.5 rounded font-bold">高安全性</span>
-                      </div>
+                      <label className="text-xs font-bold text-slate-700">設定自訂安全密鑰 (密碼)</label>
                       <input 
                         type="password" 
-                        placeholder="請輸入一個您自訂的密碼"
+                        placeholder="請輸入自訂安全密碼"
                         value={securityKey}
                         onChange={(e) => setSecurityKey(e.target.value)}
-                        className={`w-full border rounded-xl px-3 py-2.5 text-xs font-semibold text-slate-700 focus:outline-none focus:ring-2 focus:ring-rose-500 ${
-                          !securityKey ? 'bg-rose-50/50 border-rose-300' : 'bg-slate-50 border-slate-200'
-                        }`}
+                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-xs font-semibold text-slate-700"
                       />
-                      {!securityKey && (
-                        <p className="text-[10px] text-rose-500 font-bold leading-normal animate-pulse">
-                          ⚠️ 密碼不可空白！當設定為空白時，系統將會主動阻擋雲端同步以維護隱私。
-                        </p>
-                      )}
-                      <p className="text-[10px] text-slate-400 leading-normal">
-                        * 此處密碼必須與您在試算表 Apps Script 最上方設定的 `SECURITY_KEY` **完全一致**。
-                      </p>
                     </div>
 
                     {gasUrl && (
-                      <div className="flex gap-2 pt-2">
+                      <div className="flex flex-col gap-2 pt-2">
                         <button
-                          onClick={() => {
-                            setGasUrl('');
-                            setSecurityKey('');
-                            triggerNotification('info', '已關閉雲端，回到本機安全儲存。');
-                          }}
-                          className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-600 py-2 rounded-lg text-xs font-bold transition-all"
-                        >
-                          中斷安全連接
-                        </button>
-                        <button
-                          onClick={handleCloudExport}
+                          onClick={handleCloudSync}
                           disabled={syncLoading}
-                          className="flex-1 bg-rose-500 hover:bg-rose-600 disabled:bg-rose-300 text-white py-2 rounded-lg text-xs font-bold transition-all shadow-sm"
+                          className="w-full bg-rose-500 hover:bg-rose-600 disabled:bg-rose-300 text-white py-2.5 rounded-xl text-xs font-bold shadow-sm"
                         >
-                          {syncLoading ? '認證中...' : '測試上傳驗證'}
+                          🔄 智慧雙向差異同步
                         </button>
+                        
+                        <div className="flex gap-2">
+                          <button
+                            onClick={handleCloudImportAll}
+                            disabled={syncLoading}
+                            className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 py-2 rounded-lg text-[10px] font-bold"
+                          >
+                            📥 全量備份下載
+                          </button>
+                          <button
+                            onClick={handleCloudExportAll}
+                            disabled={syncLoading}
+                            className="flex-1 bg-slate-100 hover:bg-slate-200 text-rose-600 py-2 rounded-lg text-[10px] font-bold"
+                          >
+                            📤 強制覆蓋雲端
+                          </button>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -1400,24 +1435,119 @@
                   </div>
                 </div>
 
+                {/* 右側：讓其他人可以一鍵複製的 Apps Script 程式碼塊 */}
                 <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-sm lg:col-span-2 space-y-4">
                   <div>
-                    <h3 className="text-base font-black text-slate-900">2. 雲端密鑰驗證設定指南</h3>
+                    <h3 className="text-base font-black text-slate-900">2. 雲端【智慧增量】專用 Google Apps Script 程式碼</h3>
                     <p className="text-xs text-slate-400 mt-0.5">
-                      為了實現最強的自訂安全防護，您的 Apps Script 必須使用下方內含「安全密鑰驗證功能」的最新程式碼。
+                      若要啟用小工具的智慧「差異同步」，請將下方最新代碼貼入您的 Google Apps Script 編輯器中取代原本代碼：
                     </p>
                   </div>
 
                   <div className="space-y-4 text-xs text-slate-600 leading-relaxed">
-                    <div>
-                      <h4 className="font-extrabold text-slate-800 mb-1 flex items-center gap-1.5">
-                        <span className="w-4 h-4 bg-slate-900 text-white rounded-full flex items-center justify-center text-[10px]">1</span>
-                        複製並更新 Google Apps Script
-                      </h4>
-                      <p className="pl-5 mb-2 text-slate-500">
-                        請確認您的 GAS 程式碼最上方有設定與此處相同的密碼。
-                      </p>
+                    <div className="bg-slate-950 text-slate-300 p-3 rounded-xl font-mono text-[10px] max-h-[350px] overflow-y-auto pl-5 relative select-all cursor-pointer">
+                      <pre>{`// ==========================================
+// 🛡️ 最重要安全設定：請在下方引號中設定您的安全密鑰 (自訂密碼)
+// ==========================================
+var SECURITY_KEY = "您的自訂安全密碼_請務必修改此處"; 
+
+function doGet(e) {
+  var clientKey = e.parameter ? e.parameter.key : "";
+  if (!clientKey || clientKey.toString().trim() !== SECURITY_KEY.trim()) {
+    return ContentService.createTextOutput(JSON.stringify({
+      status: "error", 
+      message: "拒絕存取：您提供的小工具安全密鑰與雲端不一致！請檢查空白或大小寫。"
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  try {
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+    var data = sheet.getDataRange().getValues();
+    var records = [];
+    if (data.length > 1) {
+      for (var i = 1; i < data.length; i++) {
+        try {
+          records.push({
+            id: data[i][0] ? data[i][0].toString() : "",
+            date: Utilities.formatDate(new Date(data[i][1]), Session.getScriptTimeZone(), "yyyy-MM-dd"),
+            period: data[i][2] ? data[i][2].toString() : "",
+            avgSystolic: parseInt(data[i][3]) || 0,
+            avgDiastolic: parseInt(data[i][4]) || 0,
+            avgPulse: parseInt(data[i][5]) || 0,
+            readings: JSON.parse(data[i][6] || "[]")
+          });
+        } catch(err) {}
+      }
+    }
+    return ContentService.createTextOutput(JSON.stringify(records)).setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({
+      status: "error",
+      message: "讀取試算表失敗：" + err.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+function doPost(e) {
+  try {
+    if (!e || !e.postData || !e.postData.contents) {
+      return ContentService.createTextOutput(JSON.stringify({status: "error", message: "無傳輸內容"})).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    var params = JSON.parse(e.postData.contents);
+    var clientKey = params.key;
+    if (!clientKey || clientKey.toString().trim() !== SECURITY_KEY.trim()) {
+      return ContentService.createTextOutput(JSON.stringify({status: "error", message: "安全驗證失敗"})).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+    
+    // 行級差異/增量更新，大幅提升效率
+    if (params.action === "upsertRecords") {
+      var data = sheet.getDataRange().getValues();
+      var idRowMap = {};
+      for (var i = 1; i < data.length; i++) {
+        if (data[i][0]) {
+          idRowMap[data[i][0].toString()] = i + 1;
+        }
+      }
+
+      var recordsToUpdate = params.records;
+      for (var j = 0; j < recordsToUpdate.length; j++) {
+        var r = recordsToUpdate[j];
+        var rowIndex = idRowMap[r.id];
+        var rowData = [r.id, r.date, r.period, r.avgSystolic, r.avgDiastolic, r.avgPulse, JSON.stringify(r.readings)];
+        
+        if (rowIndex) {
+          sheet.getRange(rowIndex, 1, 1, 7).setValues([rowData]);
+        } else {
+          sheet.appendRow(rowData);
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({status: "success", count: recordsToUpdate.length})).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // 全量覆蓋備份功能 (備份與重置用)
+    if (params.action === "saveAll") {
+      sheet.clear();
+      sheet.appendRow(["ID", "Date", "Period", "Avg Systolic", "Avg Diastolic", "Avg Pulse", "Raw Readings JSON"]);
+      var records = params.records;
+      for (var i = 0; i < records.length; i++) {
+        var r = records[i];
+        sheet.appendRow([r.id, r.date, r.period, r.avgSystolic, r.avgDiastolic, r.avgPulse, JSON.stringify(r.readings)]);
+      }
+      return ContentService.createTextOutput(JSON.stringify({status: "success"})).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    return ContentService.createTextOutput(JSON.stringify({status: "error", message: "未知指令"})).setMimeType(ContentService.MimeType.JSON);
+  } catch(err) {
+    return ContentService.createTextOutput(JSON.stringify({status: "error", message: err.toString()})).setMimeType(ContentService.MimeType.JSON);
+  }
+}`}</pre>
                     </div>
+                    <p className="text-slate-400 text-[11px]">
+                      💡 操作：複製代碼覆蓋原本腳本後，點選 **「部署」 -> 「管理部署」 -> 「編輯」 -> 選擇「建立新版本」 -> 按下「部署」** 即可。
+                    </p>
                   </div>
                 </div>
               </div>
@@ -1426,37 +1556,22 @@
             {activeTab === 'guide' && (
               <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
-                  <div className="p-2 bg-rose-50 text-rose-500 rounded-xl w-fit mb-3">⏱️</div>
                   <h3 className="font-bold text-slate-950 mb-2">步驟一：量測前準備</h3>
-                  <ul className="text-xs text-slate-600 space-y-2 list-disc list-inside">
-                    <li>量測前 30 分鐘內請勿飲用咖啡、茶、酒精、或吸菸及進行劇烈運動。</li>
-                    <li>排空尿液，憋尿會導致交感神經興奮，使血壓升高 10-15 mmHg。</li>
-                    <li>量測前在安靜的房間坐著放鬆 5 分鐘。</li>
-                  </ul>
+                  <p className="text-xs text-slate-600">量測前請避免咖啡因、憋尿並靜坐放鬆五分鐘。</p>
                 </div>
-
                 <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
-                  <div className="p-2 bg-blue-50 text-blue-500 rounded-xl w-fit mb-3">🩺</div>
                   <h3 className="font-bold text-slate-950 mb-2">步驟二：正確姿勢與綁法</h3>
-                  <ul className="text-xs text-slate-600 space-y-2 list-disc list-inside">
-                    <li>挺直靠著椅背坐好，雙腳平放於地板上，請勿翹腳。</li>
-                    <li>手臂平放在桌上，確保袖帶中心高度與心臟在同一水平線上。</li>
-                  </ul>
+                  <p className="text-xs text-slate-600">挺直靠背，不翹腳。袖帶高度需與心臟在同一水平線。</p>
                 </div>
-
                 <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
-                  <div className="p-2 bg-amber-50 text-amber-500 rounded-xl w-fit mb-3">🗓️</div>
-                  <h3 className="font-bold text-slate-950 mb-2">步驟三：黃金測量時間 722</h3>
-                  <ul className="text-xs text-slate-600 space-y-2 list-disc list-inside">
-                    <li>台灣高血壓學會推薦「722法則」：</li>
-                    <li><strong>7</strong>：連續量測 7 天。</li>
-                    <li><strong>2</strong>：每天量 2 回（早上、晚上）。</li>
-                  </ul>
+                  <h3 className="font-bold text-slate-950 mb-2">步驟三：台灣 722 法則</h3>
+                  <p className="text-xs text-slate-600">連續記錄7天，每日早晚各量1回，每回重複兩次取平均。</p>
                 </div>
               </div>
             )}
           </main>
 
+          {/* 4. 新增/編輯視窗 */}
           {showModal && (
             <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
               <div className="bg-white rounded-3xl w-full max-w-lg shadow-2xl border border-slate-100 overflow-hidden transform transition-all">
@@ -1537,7 +1652,7 @@
                               <span className="text-[10px] font-bold text-slate-500 text-center">心率 (心跳)</span>
                               <input 
                                 type="number" required min="30" max="200"
-                                value={reading.pulse}
+                                value={reading.pulse || ''}
                                 onChange={(e) => handleReadingChange(index, 'pulse', e.target.value)}
                                 className="bg-white border border-slate-200 rounded-lg py-1 px-2 text-center text-sm font-bold text-slate-800"
                               />
@@ -1562,7 +1677,7 @@
                         {currentFormAvg.sys} / {currentFormAvg.dia} <span className="text-xs text-slate-400 font-bold">mmHg</span>
                       </div>
                       <div className="text-xs font-bold text-slate-500 mt-0.5">
-                        心率: {currentFormAvg.pulse} <span className="text-[10px]">bpm</span>
+                        心率: {currentFormAvg.pulse || '--'} <span className="text-[10px]">bpm</span>
                       </div>
                     </div>
                   </div>
@@ -1575,6 +1690,86 @@
               </div>
             </div>
           )}
+
+          {/* 5. A4 專業健康 PDF 報告生成專用模板 (點擊生成時才會暫時顯示以進行截圖繪製，格式固定為 A4 高質感排版) */}
+          <div id="pdf-report-area" className="hidden p-10 bg-white text-slate-900 w-[794px]" style={{ fontFamily: 'sans-serif' }}>
+            <div className="border-b-4 border-rose-500 pb-4 mb-6">
+              <div className="flex justify-between items-end">
+                <div>
+                  <h1 className="text-2xl font-black tracking-tight text-slate-900">個人血壓心率健康追蹤報告</h1>
+                  <p className="text-xs text-slate-500 mt-1">產出時間: {new Date().toLocaleString('zh-TW')} | 歷史範圍: {startDate} 至 {endDate}</p>
+                </div>
+                <div>
+                  <span className="text-xs font-bold text-rose-500 bg-rose-50 border border-rose-100 px-3 py-1 rounded-full">診斷參考文件</span>
+                </div>
+              </div>
+            </div>
+
+            {/* 報告綜合平均彙整 */}
+            <div className="grid grid-cols-3 gap-4 mb-8">
+              <div className="bg-slate-50 p-4 rounded-xl border border-slate-100">
+                <div className="text-[10px] font-bold text-slate-500">此區間綜合平均血壓</div>
+                <div className="text-xl font-black mt-1 text-slate-800">{stats.totalSysAvg} / {stats.totalDiaAvg} <span className="text-xs text-slate-400">mmHg</span></div>
+                <div className="text-[10px] text-slate-400 mt-1">分級：{getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label}</div>
+              </div>
+              <div className="bg-slate-50 p-4 rounded-xl border border-slate-100">
+                <div className="text-[10px] font-bold text-slate-500">起床 (早上) 平均值</div>
+                <div className="text-xl font-black mt-1 text-slate-800">{stats.mornSysAvg || '--'} / {stats.mornDiaAvg || '--'} <span className="text-xs text-slate-400">mmHg</span></div>
+                <div className="text-[10px] text-slate-400 mt-1">有效天數：{stats.mornCount} 天</div>
+              </div>
+              <div className="bg-slate-50 p-4 rounded-xl border border-slate-100">
+                <div className="text-[10px] font-bold text-slate-500">睡前 (晚上) 平均值</div>
+                <div className="text-xl font-black mt-1 text-slate-800">{stats.evenSysAvg || '--'} / {stats.evenDiaAvg || '--'} <span className="text-xs text-slate-400">mmHg</span></div>
+                <div className="text-[10px] text-slate-400 mt-1">有效天數：{stats.evenCount} 天</div>
+              </div>
+            </div>
+
+            {/* 圖形渲染輸出 */}
+            <div className="space-y-6 mb-8">
+              <div>
+                <h4 className="text-xs font-extrabold text-slate-800 mb-2 pl-2 border-l-4 border-rose-500">一、 收縮壓與舒張壓長期趨勢圖表</h4>
+                {renderSVGChart('bp', true)}
+              </div>
+              <div className="pt-4 border-t border-slate-100">
+                <h4 className="text-xs font-extrabold text-slate-800 mb-2 pl-2 border-l-4 border-pink-500">二、 平均心率變化趨勢</h4>
+                {renderSVGChart('hr', true)}
+              </div>
+            </div>
+
+            {/* 量測明細清單 (自動翻頁) */}
+            <div className="page-break"></div>
+            <div className="pt-6">
+              <h4 className="text-xs font-extrabold text-slate-800 mb-3 pl-2 border-l-4 border-slate-900">三、 量測原始數據歷史清單日誌 ({filteredRecords.length} 筆)</h4>
+              <table className="w-full text-left text-[10px] border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-200 text-slate-500 font-bold bg-slate-50">
+                    <th className="py-2 px-3">日期 / 時段</th>
+                    <th className="py-2 px-3">平均血壓 (mmHg)</th>
+                    <th className="py-2 px-3">平均心跳 (bpm)</th>
+                    <th className="py-2 px-3">單次量測紀錄明細</th>
+                    <th className="py-2 px-3">狀態判定</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {filteredRecords.map((r, idx) => (
+                    <tr key={idx}>
+                      <td className="py-2 px-3 font-semibold text-slate-700">{r.date} ({r.period === 'morning' ? '🌞 早上' : '🌙 晚上'})</td>
+                      <td className="py-2 px-3 font-bold">{r.avgSystolic} / {r.avgDiastolic}</td>
+                      <td className="py-2 px-3 font-semibold">{r.avgPulse || '--'}</td>
+                      <td className="py-2 px-3 text-slate-500 font-mono">
+                        {r.readings.map((reading, i) => `[#${i+1}] ${reading.systolic}/${reading.diastolic}`).join(' ')}
+                      </td>
+                      <td className="py-2 px-3 font-semibold">{getBPLevel(r.avgSystolic, r.avgDiastolic).label}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="mt-12 text-center text-[10px] text-slate-400 border-t border-slate-100 pt-4">
+              * 本健康分析文件僅供受測者追蹤個人生理狀態參考，非正式醫療診斷證明，診斷請諮詢專業醫師。
+            </div>
+          </div>
 
           {customConfirm && (
             <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
@@ -1602,7 +1797,6 @@
       );
     }
 
-    // 將 React 元件掛載到網頁中
     const root = ReactDOM.createRoot(document.getElementById('root'));
     root.render(<App />);
   </script>
