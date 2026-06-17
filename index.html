@@ -8,12 +8,12 @@
   <!-- 載入 Tailwind CSS (排版美化) -->
   <script src="https://cdn.tailwindcss.com"></script>
   
-  <!-- 載入 React 與 ReactDOM 核心 -->
-  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <!-- 載入 React 與 ReactDOM 核心 (鎖定穩定的 18.3.1 版本) -->
+  <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
   
-  <!-- 載入 Babel (用於在瀏覽器中即時解析 JSX 語法) -->
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- 載入 Babel (鎖定穩定的 7.26.4 版本，避免未來的解析器無預警變更規格) -->
+  <script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js" crossorigin></script>
 
   <!-- 載入 PDF 導出專用核心庫 (html2canvas & jsPDF) -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
@@ -24,7 +24,7 @@
 
   <!-- React 程式碼區塊 -->
   <script type="text/babel">
-    const { useState, useMemo, useEffect } = React;
+    const { useState, useMemo, useEffect, useRef } = React;
 
     // ----------------------------------------------------
     // 模擬數據：僅在使用者第一次打開、且本地完全無資料時預載
@@ -36,7 +36,7 @@
         const date = new Date(now);
         date.setDate(now.getDate() - i);
         const dateStr = date.toISOString().split('T')[0];
-        
+                
         const morningCount = 2;
         const morningReadings = [
           { systolic: 122, diastolic: 80, pulse: 68 },
@@ -89,6 +89,32 @@
       return { label: '正常血壓', color: 'text-emerald-500 bg-emerald-50 border-emerald-200', dotColor: '#10b981' };
     };
 
+    // ----------------------------------------------------
+    // 貝茲平滑曲線演算器 (Catmull-Rom 改良算法)
+    // ----------------------------------------------------
+    const formatBezierPath = (points) => {
+      if (points.length === 0) return '';
+      if (points.length === 1) return `M ${points[0].x} ${points[0].y}`;
+      if (points.length === 2) return `M ${points[0].x} ${points[0].y} L ${points[1].x} ${points[1].y}`;
+      
+      let d = `M ${points[0].x} ${points[0].y}`;
+      for (let i = 0; i < points.length - 1; i++) {
+        const p0 = points[i === 0 ? i : i - 1];
+        const p1 = points[i];
+        const p2 = points[i + 1];
+        const p3 = points[i + 2 >= points.length ? i + 1 : i + 2];
+        
+        // 切線張力控制係數
+        const cp1x = p1.x + (p2.x - p0.x) * 0.15;
+        const cp1y = p1.y + (p2.y - p0.y) * 0.15;
+        const cp2x = p2.x - (p3.x - p1.x) * 0.15;
+        const cp2y = p2.y - (p3.y - p1.y) * 0.15;
+        
+        d += ` C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${p2.x} ${p2.y}`;
+      }
+      return d;
+    };
+
     function App() {
       // ----------------------------------------------------
       // 狀態管理 (LocalStorage 優先)
@@ -109,12 +135,11 @@
       // UI 與同步狀態
       const [activeTab, setActiveTab] = useState('dashboard');
       const [syncLoading, setSyncLoading] = useState(false);
-      const [notification, setNotification] = useState(null); // { type: 'success'|'error'|'info', text: string }
-      
+      const [notification, setNotification] = useState(null); 
       const [customConfirm, setCustomConfirm] = useState(null); 
       const [customAlert, setCustomAlert] = useState(null); 
 
-      // 詳細紀錄「日期/時段」預設排序：預設 'desc' (由新到舊)
+      // 詳細紀錄預設排序：'desc' (由新到舊)
       const [sortOrder, setSortOrder] = useState('desc'); 
 
       // 篩選器狀態
@@ -127,7 +152,7 @@
       const [endDate, setEndDate] = useState(new Date().toISOString().split('T')[0]);
       const [filterPeriod, setFilterPeriod] = useState('all');
       const [filterMetric, setFilterMetric] = useState('all');
-      
+            
       // 表單狀態
       const [showModal, setShowModal] = useState(false);
       const [editId, setEditId] = useState(null);
@@ -140,7 +165,9 @@
         { systolic: 120, diastolic: 80, pulse: 70 }
       ]);
 
+      // 互動式圖表指標狀態
       const [hoveredIndex, setHoveredIndex] = useState(null);
+      const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
 
       // ----------------------------------------------------
       // 自動將變更寫入 LocalStorage
@@ -162,6 +189,34 @@
         setTimeout(() => {
           setNotification(null);
         }, 4000);
+      };
+
+      const handlePresetChange = (preset) => {
+        setDatePreset(preset);
+        const today = new Date();
+        const endStr = today.toISOString().split('T')[0];
+        setEndDate(endStr);
+
+        if (preset === '7days') {
+          const d = new Date(); d.setDate(today.getDate() - 6);
+          setStartDate(d.toISOString().split('T')[0]);
+        } else if (preset === '14days') {
+          const d = new Date(); d.setDate(today.getDate() - 13);
+          setStartDate(d.toISOString().split('T')[0]);
+        } else if (preset === '30days') {
+          const d = new Date(); d.setDate(today.getDate() - 29);
+          setStartDate(d.toISOString().split('T')[0]);
+        } else if (preset === '90days') {
+          const d = new Date(); d.setMonth(today.getMonth() - 3);
+          setStartDate(d.toISOString().split('T')[0]);
+        } else if (preset === 'all') {
+          if (records.length === 0) {
+            setStartDate(endStr);
+          } else {
+            const dates = records.map(r => r.date).sort();
+            setStartDate(dates[0]);
+          }
+        }
       };
 
       // ----------------------------------------------------
@@ -189,17 +244,15 @@
 
         try {
           const trimmedKey = securityKey.trim();
-
-          // 1. 先從雲端抓取目前的完整資料
           const fetchUrl = `${gasUrl}?key=${encodeURIComponent(trimmedKey)}`;
           const response = await fetch(fetchUrl);
-          
+                    
           if (!response.ok) {
             throw new Error(`雲端連線失敗 (HTTP ${response.status})`);
           }
-          
+                    
           const cloudData = await response.json();
-          
+                    
           if (cloudData && cloudData.status === 'error') {
             setCustomAlert({
               title: "❌ 雲端驗證失敗",
@@ -214,7 +267,6 @@
           const remoteMap = new Map(remoteRecords.map(r => [r.id, r]));
           const localMap = new Map(records.map(r => [r.id, r]));
 
-          // 找出「本地需要同步到雲端」的變動/新增數據
           const localChanges = [];
           records.forEach(localRec => {
             const remoteRec = remoteMap.get(localRec.id);
@@ -223,7 +275,6 @@
             }
           });
 
-          // 找出「雲端存在但本地遺失」的外部更新數據
           const cloudOnlyRecords = [];
           remoteRecords.forEach(remoteRec => {
             if (!localMap.has(remoteRec.id)) {
@@ -234,10 +285,9 @@
           let updatedRecordsList = [...records];
           let updatedInCloud = 0;
 
-          // 2. 如果本地有更新，採用「增量式」提交變更
           if (localChanges.length > 0) {
             triggerNotification('info', `正在增量上傳 ${localChanges.length} 筆變更數據至試算表...`);
-            
+                        
             const payload = {
               action: 'upsertRecords',
               key: trimmedKey,
@@ -246,9 +296,7 @@
 
             const postResponse = await fetch(gasUrl, {
               method: 'POST',
-              headers: {
-                'Content-Type': 'text/plain;charset=utf-8',
-              },
+              headers: { 'Content-Type': 'text/plain;charset=utf-8' },
               body: JSON.stringify(payload)
             });
 
@@ -264,12 +312,10 @@
             }
           }
 
-          // 3. 合併雲端獨有資料回本地
           if (cloudOnlyRecords.length > 0) {
             updatedRecordsList = [...cloudOnlyRecords, ...updatedRecordsList];
           }
 
-          // 更新狀態
           if (localChanges.length > 0 || cloudOnlyRecords.length > 0) {
             setRecords(updatedRecordsList);
             triggerNotification('success', `✨ 智慧同步成功！雲端更新 ${updatedInCloud} 筆，本地下載合併 ${cloudOnlyRecords.length} 筆。`);
@@ -289,7 +335,6 @@
         }
       };
 
-      // 覆蓋雲端 (強制整批覆蓋上傳)
       const handleCloudExportAll = async () => {
         setCustomConfirm({
           message: "此為全覆蓋操作，會清除雲端試算表並整批重新上傳本地所有資料，確定要繼續嗎？",
@@ -324,7 +369,6 @@
         });
       };
 
-      // 強制重載 (清除本地，下載雲端整張表)
       const handleCloudImportAll = async () => {
         setCustomConfirm({
           message: "確定要清空本地資料，並從雲端強制重新下載全部紀錄嗎？",
@@ -351,9 +395,6 @@
         });
       };
 
-      // ----------------------------------------------------
-      // 詳細紀錄「日期 / 時段」雙向排序控制
-      // ----------------------------------------------------
       const toggleSortOrder = () => {
         setSortOrder(prev => prev === 'desc' ? 'asc' : 'desc');
         triggerNotification('info', `已切換為 ${sortOrder === 'desc' ? '遞增排序 (舊到新)' : '遞減排序 (新到舊)'}`);
@@ -372,7 +413,6 @@
           if (a.date !== b.date) {
             return sortOrder === 'desc' ? dateB - dateA : dateA - dateB;
           }
-          // 同一天：降密排序時晚上(evening)在最上，升密排序時早上(morning)在最上
           const periodOrder = sortOrder === 'desc'
             ? (a.period === 'evening' ? -1 : 1)
             : (a.period === 'morning' ? -1 : 1);
@@ -381,53 +421,60 @@
       }, [records, startDate, endDate, filterPeriod, sortOrder]);
 
       // ----------------------------------------------------
-      // A4 專業級 PDF 報告導出與格式化控制
+      // 計算 PDF 表格切割區塊 (每頁20筆以確保 A4 不斷行)
+      // ----------------------------------------------------
+      const pdfTableChunks = useMemo(() => {
+        if (filteredRecords.length === 0) return [[]];
+        const chunkSize = 20; 
+        const chunks = [];
+        for (let i = 0; i < filteredRecords.length; i += chunkSize) {
+          chunks.push(filteredRecords.slice(i, i + chunkSize));
+        }
+        return chunks;
+      }, [filteredRecords]);
+
+      // ----------------------------------------------------
+      // A4 專業級分頁式 PDF 報告導出邏輯
       // ----------------------------------------------------
       const handleExportPDF = async () => {
         setSyncLoading(true);
-        triggerNotification('info', '正在重構版面，準備產生 A4 行動健康診斷報告...');
+        triggerNotification('info', '正在動態分頁渲染，準備產生 A4 臨床級健康報告...');
 
-        // 顯示隱藏的 A4 專用渲染版塊
         const pdfArea = document.getElementById('pdf-report-area');
         pdfArea.classList.remove('hidden');
 
         try {
-          // 給予短暫延遲，讓 SVG 及容器字體渲染完畢
-          await new Promise(resolve => setTimeout(resolve, 800));
+          await new Promise(resolve => setTimeout(resolve, 1000));
 
-          const canvas = await html2canvas(pdfArea, {
-            scale: 2, // 雙倍超高畫質
-            useCORS: true,
-            allowTaint: true,
-            logging: false,
-            backgroundColor: '#ffffff'
-          });
-
-          const imgData = canvas.toDataURL('image/jpeg', 1.0);
+          const pages = pdfArea.querySelectorAll('.pdf-page-container');
           const { jsPDF } = window.jspdf;
-          const pdf = new jsPDF('p', 'mm', 'a4');
           
+          const pdf = new jsPDF('p', 'mm', 'a4');
           const imgWidth = 210;
-          const pageHeight = 297;
-          const imgHeight = (canvas.height * imgWidth) / canvas.width;
-          let heightLeft = imgHeight;
-          let position = 0;
+          const imgHeight = 297;
 
-          // 繪製第一頁
-          pdf.addImage(imgData, 'JPEG', 0, position, imgWidth, imgHeight);
-          heightLeft -= pageHeight;
+          for (let i = 0; i < pages.length; i++) {
+            const pageElement = pages[i];
+            
+            const canvas = await html2canvas(pageElement, {
+              scale: 2.2, 
+              useCORS: true,
+              allowTaint: true,
+              logging: false,
+              backgroundColor: '#ffffff'
+            });
 
-          // 跨多頁自動精準切割貼上
-          while (heightLeft >= 0) {
-            position = heightLeft - imgHeight;
-            pdf.addPage();
-            pdf.addImage(imgData, 'JPEG', 0, position, imgWidth, imgHeight);
-            heightLeft -= pageHeight;
+            const imgData = canvas.toDataURL('image/jpeg', 1.0);
+            
+            if (i > 0) {
+              pdf.addPage();
+            }
+            pdf.addImage(imgData, 'JPEG', 0, 0, imgWidth, imgHeight);
           }
 
           const filename = `血壓健康報告_${startDate}_至_${endDate}.pdf`;
           pdf.save(filename);
-          triggerNotification('success', '🎉 精美 A4 PDF 健康報告已導出並下載！');
+          triggerNotification('success', '🎉 臨床級 A4 PDF 健康報告導出成功，分頁完整且無斷行裂痕！');
 
         } catch (error) {
           console.error(error);
@@ -438,7 +485,6 @@
         }
       };
 
-      // 依「日期」分組
       const groupedChartData = useMemo(() => {
         const groups = {};
         filteredRecords.forEach(r => {
@@ -454,7 +500,6 @@
         return Object.values(groups).sort((a, b) => new Date(a.date) - new Date(b.date));
       }, [filteredRecords]);
 
-      // 統計數據
       const stats = useMemo(() => {
         const result = {
           mornSysAvg: 0, mornDiaAvg: 0, mornPulseAvg: 0, mornCount: 0,
@@ -464,7 +509,7 @@
 
         let mSys = 0, mDia = 0, mPulse = 0;
         let eSys = 0, eDia = 0, ePulse = 0;
-        
+                
         filteredRecords.forEach(r => {
           if (r.period === 'morning') {
             mSys += r.avgSystolic;
@@ -500,9 +545,6 @@
         return result;
       }, [filteredRecords]);
 
-      // ----------------------------------------------------
-      // 表單、模態視窗與數據刪改核心操作函數
-      // ----------------------------------------------------
       const openAddModal = () => {
         setEditId(null);
         setFormDate(new Date().toISOString().split('T')[0]);
@@ -538,7 +580,7 @@
 
       const saveRecord = (e) => {
         e.preventDefault();
-        
+                
         const validReadings = formReadings.map(r => ({
           systolic: typeof r.systolic === 'number' && !isNaN(r.systolic) ? r.systolic : 120,
           diastolic: typeof r.diastolic === 'number' && !isNaN(r.diastolic) ? r.diastolic : 80,
@@ -605,9 +647,7 @@
         };
       }, [formReadings]);
 
-      // ----------------------------------------------------
-      // SVG 趨勢圖表基礎渲染 (含 Y軸刻度、X軸刻度及高對比度座標系統)
-      // ----------------------------------------------------
+      // SVG 趨勢圖表基礎渲染 (升級平滑貝茲曲線與十字對齊準星)
       const renderSVGChart = (type, isForPDF = false) => {
         if (groupedChartData.length === 0) {
           return (
@@ -623,19 +663,15 @@
         const paddingBottom = 45;
         const width = isForPDF ? 1000 : 800; 
         const height = 300;
-        
+                
         const chartWidth = width - paddingLeft - paddingRight;
         const chartHeight = height - paddingTop - paddingBottom;
 
-        let minVal = 40;
-        let maxVal = 180;
-        let yTicks = [];
+        let minVal = 50;
+        let maxVal = 170;
+        let yTicks = [60, 80, 100, 120, 140, 160];
 
-        if (type === 'bp') {
-          minVal = 50;
-          maxVal = 170;
-          yTicks = [60, 80, 100, 120, 140, 160];
-        } else {
+        if (type !== 'bp') {
           minVal = 40;
           maxVal = 130;
           yTicks = [50, 70, 90, 110, 130];
@@ -651,7 +687,7 @@
           return paddingTop + chartHeight - ((val - minVal) / (maxVal - minVal)) * chartHeight;
         };
 
-        const generatePath = (key, subKey) => {
+        const generateBezierPathString = (key, subKey) => {
           const points = [];
           groupedChartData.forEach((d, idx) => {
             const item = d[key];
@@ -659,37 +695,61 @@
               const val = item[subKey];
               const x = getX(idx);
               const y = getY(val);
-              if (y !== null) {
-                points.push({ x, y });
-              }
+              if (y !== null) points.push({ x, y });
             }
           });
-          if (points.length === 0) return '';
-          return points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ');
+          return formatBezierPath(points);
+        };
+
+        const handleMouseMove = (e) => {
+          if (isForPDF) return;
+          const svgEl = e.currentTarget;
+          const rect = svgEl.getBoundingClientRect();
+          const clientX = e.clientX - rect.left;
+          const svgX = (clientX / rect.width) * width;
+
+          let closestIdx = 0;
+          let minDiff = Infinity;
+          groupedChartData.forEach((_, idx) => {
+            const diff = Math.abs(getX(idx) - svgX);
+            if (diff < minDiff) {
+              minDiff = diff;
+              closestIdx = idx;
+            }
+          });
+
+          setHoveredIndex(closestIdx);
+
+          const tooltipX = getX(closestIdx);
+          const clientY = e.clientY - rect.top;
+          const svgY = (clientY / rect.height) * height;
+          setTooltipPos({ 
+            x: tooltipX > width - 180 ? tooltipX - 170 : tooltipX + 15, 
+            y: Math.min(Math.max(svgY - 50, paddingTop), height - paddingBottom - 100) 
+          });
         };
 
         return (
-          <div className="relative overflow-x-auto">
-            <svg viewBox={`0 0 ${width} ${height}`} className="w-full min-w-[650px] h-auto select-none">
-              
-              {/* 1. 網格輔助水平線與 Y軸刻度/刻度線 */}
+          <div className="relative">
+            <svg 
+              viewBox={`0 0 ${width} ${height}`} 
+              className="w-full min-w-[650px] h-auto select-none overflow-visible"
+              onMouseMove={handleMouseMove}
+              onMouseLeave={() => setHoveredIndex(null)}
+            >
+              {/* 1. 網格輔助水平線 */}
               {yTicks.map(tick => {
                 const y = getY(tick);
                 return (
                   <g key={tick}>
-                    {/* 細灰輔助格線 */}
                     <line x1={paddingLeft} y1={y} x2={width - paddingRight} y2={y} stroke="#f1f5f9" strokeWidth="1" />
-                    
-                    {/* Y 軸主要突出刻度線 (向左凸 6px) */}
                     <line x1={paddingLeft} y1={y} x2={paddingLeft - 6} y2={y} stroke="#334155" strokeWidth="1.5" />
-                    
-                    {/* 深色高對比刻度文字 */}
                     <text x={paddingLeft - 12} y={y + 4} textAnchor="end" className="text-[10px] fill-slate-800 font-bold">{tick}</text>
                   </g>
                 );
               })}
 
-              {/* 2. X軸主刻度、主軸線與日期刻度文字 */}
+              {/* 2. X軸主刻度與日期刻度文字 */}
               {groupedChartData.map((d, idx) => {
                 const x = getX(idx);
                 const interval = Math.ceil(groupedChartData.length / 8);
@@ -699,27 +759,11 @@
 
                 return (
                   <g key={d.date}>
-                    {/* X 軸垂直突出刻度線 (向下凸 6px) */}
                     <line x1={x} y1={height - paddingBottom} x2={x} y2={height - paddingBottom + 6} stroke="#334155" strokeWidth="1.5" />
-                    
-                    {/* X 軸深色高對比刻度文字 */}
                     {showLabel && (
                       <text x={x} y={height - paddingBottom + 20} textAnchor="middle" className="text-[10px] fill-slate-800 font-bold">
                         {formattedDate}
                       </text>
-                    )}
-                    
-                    {!isForPDF && (
-                      <rect
-                        x={x - (chartWidth / Math.max(1, groupedChartData.length - 1)) / 2}
-                        y={paddingTop}
-                        width={chartWidth / Math.max(1, groupedChartData.length - 1)}
-                        height={chartHeight}
-                        fill="transparent"
-                        className="cursor-pointer"
-                        onMouseEnter={() => setHoveredIndex(idx)}
-                        onMouseLeave={() => setHoveredIndex(null)}
-                      />
                     )}
                   </g>
                 );
@@ -729,43 +773,43 @@
               <line x1={paddingLeft} y1={paddingTop} x2={paddingLeft} y2={height - paddingBottom} stroke="#334155" strokeWidth="2" />
               <line x1={paddingLeft} y1={height - paddingBottom} x2={width - paddingRight} y2={height - paddingBottom} stroke="#334155" strokeWidth="2" />
 
-              {/* 4. 醫學理想標準參考基準線 (純虛線，顏色突出、不再放置重疊文字) */}
+              {/* 4. 醫學理想標準參考基準線 */}
               {type === 'bp' ? (
                 <>
-                  {/* 收縮壓基準線：120 mmHg (暖橘色) */}
-                  <line x1={paddingLeft} y1={getY(120)} x2={width - paddingRight} y2={getY(120)} stroke="#ea580c" strokeDasharray="6 4" strokeWidth="2" />
-                  {/* 舒張壓基準線：80 mmHg (極光青色) */}
-                  <line x1={paddingLeft} y1={getY(80)} x2={width - paddingRight} y2={getY(80)} stroke="#0891b2" strokeDasharray="6 4" strokeWidth="2" />
+                  <line x1={paddingLeft} y1={getY(120)} x2={width - paddingRight} y2={getY(120)} stroke="#ea580c" strokeDasharray="6 4" strokeWidth="2" opacity="0.8" />
+                  <line x1={paddingLeft} y1={getY(80)} x2={width - paddingRight} y2={getY(80)} stroke="#0891b2" strokeDasharray="6 4" strokeWidth="2" opacity="0.8" />
                 </>
               ) : (
-                /* 靜止心率基準線：70 bpm (翡翠綠色) */
-                <line x1={paddingLeft} y1={getY(70)} x2={width - paddingRight} y2={getY(70)} stroke="#059669" strokeDasharray="6 4" strokeWidth="2" />
+                <line x1={paddingLeft} y1={getY(70)} x2={width - paddingRight} y2={getY(70)} stroke="#059669" strokeDasharray="6 4" strokeWidth="2" opacity="0.8" />
               )}
 
-              {/* 滑鼠 hover 對齊引導線 */}
+              {/* 5. 互動式十字準星輔助線 (滑鼠懸浮對齊) */}
               {!isForPDF && hoveredIndex !== null && (
-                <line 
-                  x1={getX(hoveredIndex)} 
-                  y1={paddingTop} 
-                  x2={getX(hoveredIndex)} 
-                  y2={height - paddingBottom} 
-                  stroke="#cbd5e1" 
-                  strokeWidth="1.5" 
-                  strokeDasharray="2 2"
-                />
+                <g>
+                  <line 
+                    x1={getX(hoveredIndex)} 
+                    y1={paddingTop} 
+                    x2={getX(hoveredIndex)} 
+                    y2={height - paddingBottom} 
+                    stroke="#slate-400" 
+                    strokeWidth="1.5" 
+                    strokeDasharray="3 3"
+                    className="stroke-slate-400"
+                  />
+                </g>
               )}
 
-              {/* 5. 實際量測數據曲線渲染 */}
+              {/* 6. 實際量測平滑貝茲數據曲線渲染 */}
               {type === 'bp' ? (
                 <>
                   {/* 早上收縮壓 */}
                   {(filterPeriod === 'all' || filterPeriod === 'morning') && (
                     <>
-                      <path d={generatePath('morning', 'avgSystolic')} fill="none" stroke="#f43f5e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                      <path d={generateBezierPathString('morning', 'avgSystolic')} fill="none" stroke="#f43f5e" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
                       {groupedChartData.map((d, idx) => {
                         const y = getY(d.morning?.avgSystolic);
                         return y !== null ? (
-                          <circle key={`m-sys-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#f43f5e" stroke="#ffffff" strokeWidth="1.5" />
+                          <circle key={`m-sys-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#f43f5e" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
                         ) : null;
                       })}
                     </>
@@ -773,35 +817,35 @@
                   {/* 早上舒張壓 */}
                   {(filterPeriod === 'all' || filterPeriod === 'morning') && (
                     <>
-                      <path d={generatePath('morning', 'avgDiastolic')} fill="none" stroke="#3b82f6" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                      <path d={generateBezierPathString('morning', 'avgDiastolic')} fill="none" stroke="#3b82f6" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
                       {groupedChartData.map((d, idx) => {
                         const y = getY(d.morning?.avgDiastolic);
                         return y !== null ? (
-                          <circle key={`m-dia-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#3b82f6" stroke="#ffffff" strokeWidth="1.5" />
+                          <circle key={`m-dia-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#3b82f6" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
                         ) : null;
                       })}
                     </>
                   )}
-                  {/* 晚上收縮壓 */}
+                  {/* 晚上收縮壓 (深紅虛線平滑波形) */}
                   {(filterPeriod === 'all' || filterPeriod === 'evening') && (
                     <>
-                      <path d={generatePath('evening', 'avgSystolic')} fill="none" stroke="#9f1239" strokeWidth="2" strokeDasharray="5 3" strokeLinecap="round" strokeLinejoin="round" />
+                      <path d={generateBezierPathString('evening', 'avgSystolic')} fill="none" stroke="#9f1239" strokeWidth="2" strokeDasharray="6 3" strokeLinecap="round" strokeLinejoin="round" />
                       {groupedChartData.map((d, idx) => {
                         const y = getY(d.evening?.avgSystolic);
                         return y !== null ? (
-                          <circle key={`e-sys-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#9f1239" stroke="#ffffff" strokeWidth="1.5" />
+                          <circle key={`e-sys-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#9f1239" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
                         ) : null;
                       })}
                     </>
                   )}
-                  {/* 晚上舒張壓 */}
+                  {/* 晚上舒張壓 (深藍虛線平滑波形) */}
                   {(filterPeriod === 'all' || filterPeriod === 'evening') && (
                     <>
-                      <path d={generatePath('evening', 'avgDiastolic')} fill="none" stroke="#1d4ed8" strokeWidth="2" strokeDasharray="5 3" strokeLinecap="round" strokeLinejoin="round" />
+                      <path d={generateBezierPathString('evening', 'avgDiastolic')} fill="none" stroke="#1d4ed8" strokeWidth="2" strokeDasharray="6 3" strokeLinecap="round" strokeLinejoin="round" />
                       {groupedChartData.map((d, idx) => {
                         const y = getY(d.evening?.avgDiastolic);
                         return y !== null ? (
-                          <circle key={`e-dia-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#1d4ed8" stroke="#ffffff" strokeWidth="1.5" />
+                          <circle key={`e-dia-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#1d4ed8" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
                         ) : null;
                       })}
                     </>
@@ -812,11 +856,11 @@
                   {/* 早上心率 */}
                   {(filterPeriod === 'all' || filterPeriod === 'morning') && (
                     <>
-                      <path d={generatePath('morning', 'avgPulse')} fill="none" stroke="#ec4899" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                      <path d={generateBezierPathString('morning', 'avgPulse')} fill="none" stroke="#ec4899" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
                       {groupedChartData.map((d, idx) => {
                         const y = getY(d.morning?.avgPulse);
                         return y !== null ? (
-                          <circle key={`m-pulse-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#ec4899" stroke="#ffffff" strokeWidth="1.5" />
+                          <circle key={`m-pulse-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#ec4899" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
                         ) : null;
                       })}
                     </>
@@ -824,11 +868,11 @@
                   {/* 晚上心率 */}
                   {(filterPeriod === 'all' || filterPeriod === 'evening') && (
                     <>
-                      <path d={generatePath('evening', 'avgPulse')} fill="none" stroke="#8b5cf6" strokeWidth="2" strokeDasharray="5 3" strokeLinecap="round" strokeLinejoin="round" />
+                      <path d={generateBezierPathString('evening', 'avgPulse')} fill="none" stroke="#8b5cf6" strokeWidth="2" strokeDasharray="6 3" strokeLinecap="round" strokeLinejoin="round" />
                       {groupedChartData.map((d, idx) => {
                         const y = getY(d.evening?.avgPulse);
                         return y !== null ? (
-                          <circle key={`e-pulse-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#8b5cf6" stroke="#ffffff" strokeWidth="1.5" />
+                          <circle key={`e-pulse-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#8b5cf6" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
                         ) : null;
                       })}
                     </>
@@ -836,18 +880,60 @@
                 </>
               )}
             </svg>
+
+            {/* 7. 智慧 HTML 浮動對齊提示面板 (Tooltip) */}
+            {!isForPDF && hoveredIndex !== null && groupedChartData[hoveredIndex] && (
+              <div 
+                className="absolute z-40 bg-slate-900/90 text-white p-3 rounded-xl shadow-xl border border-slate-700 pointer-events-none text-xs backdrop-blur-xs min-w-[155px] space-y-2 transition-all duration-100 ease-out"
+                style={{ left: `${(tooltipPos.x / width) * 100}%`, top: `${tooltipPos.y}px` }}
+              >
+                <div className="font-black border-b border-slate-700 pb-1 text-[11px] tracking-wide text-slate-300">
+                  🗓️ {groupedChartData[hoveredIndex].date}
+                </div>
+                
+                {/* 早上數據摘要 */}
+                {groupedChartData[hoveredIndex].morning ? (
+                  <div className="space-y-0.5">
+                    <div className="text-amber-400 font-bold text-[10px] flex items-center gap-1">🌞 早上量測 <span className="text-[9px] text-slate-400">({groupedChartData[hoveredIndex].morning.readings.length}次)</span></div>
+                    <div className="font-mono text-[11px] pl-3">
+                      血壓: <strong className="text-white text-xs">{groupedChartData[hoveredIndex].morning.avgSystolic}/{groupedChartData[hoveredIndex].morning.avgDiastolic}</strong>
+                    </div>
+                    {type !== 'bp' && (
+                      <div className="font-mono text-[11px] pl-3 text-slate-300">
+                        心率: <span className="text-pink-400">{groupedChartData[hoveredIndex].morning.avgPulse} bpm</span>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-slate-500 text-[10px] italic">🌞 早上無紀錄</div>
+                )}
+
+                {/* 晚上數據摘要 */}
+                {groupedChartData[hoveredIndex].evening ? (
+                  <div className="space-y-0.5 pt-1 border-t border-slate-800/60">
+                    <div className="text-indigo-400 font-bold text-[10px] flex items-center gap-1">🌙 晚上量測 <span className="text-[9px] text-slate-400">({groupedChartData[hoveredIndex].evening.readings.length}次)</span></div>
+                    <div className="font-mono text-[11px] pl-3">
+                      血壓: <strong className="text-white text-xs">{groupedChartData[hoveredIndex].evening.avgSystolic}/{groupedChartData[hoveredIndex].evening.avgDiastolic}</strong>
+                    </div>
+                    {type !== 'bp' && (
+                      <div className="font-mono text-[11px] pl-3 text-slate-300">
+                        心率: <span className="text-purple-400">{groupedChartData[hoveredIndex].evening.avgPulse} bpm</span>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-slate-500 text-[10px] italic">🌙 晚上無紀錄</div>
+                )}
+              </div>
+            )}
           </div>
         );
       };
 
-      // ----------------------------------------------------
-      // 💡 升級整合：HTML 圖例說明面板與 SVG 趨勢圖之聯動容器
-      // ----------------------------------------------------
       const renderChartWithLegend = (type, isForPDF = false) => {
         const isBP = type === 'bp';
-        return (
+        return (          
           <div className="space-y-4">
-            {/* HTML 多功能圖例說明面板 */}
             <div className={`flex flex-wrap gap-x-4 gap-y-2 text-xs bg-slate-50 p-3 rounded-xl border border-slate-100 ${isForPDF ? 'bg-white border-slate-200' : ''}`}>
               {isBP ? (
                 <>
@@ -875,7 +961,6 @@
                       <span className="font-bold text-slate-700">🌙 晚上舒張壓 (虛線)</span>
                     </div>
                   )}
-                  {/* 基準理想線圖例 (獨立色彩與線條，無文字碰撞重疊) */}
                   <div className="flex items-center gap-1.5 border-l border-slate-200 pl-3 ml-1">
                     <span className="w-5 h-0.5 inline-block border-t-2 border-dashed border-[#ea580c] shrink-0"></span>
                     <span className="font-bold text-orange-700">理想高壓標準線 (120 mmHg)</span>
@@ -989,7 +1074,6 @@
           </header>
 
           <main className="max-w-6xl mx-auto px-4 py-6">
-            
             {gasUrl && (
               <div className="bg-slate-900 text-white rounded-2xl p-4 mb-6 flex flex-col md:flex-row items-center justify-between gap-3 shadow-md">
                 <div className="flex items-center gap-2 text-xs">
@@ -1233,7 +1317,7 @@
                   </div>
                 </div>
 
-                {/* 圖表 (整合了圖例渲染與高對比刻度標記) */}
+                {/* 圖表區塊 */}
                 <div className="grid grid-cols-1 gap-6">
                   <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm relative">
                     <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 mb-6 border-b border-slate-50 pb-4">
@@ -1241,7 +1325,7 @@
                         <h3 className="text-lg font-black text-slate-900 flex items-center gap-2">
                           📈 血壓與心率趨勢圖表
                         </h3>
-                        <p className="text-xs text-slate-400 mt-0.5">顯示每日早/晚多次量測所得之「平均值」與「醫學理想對照線」變化。</p>
+                        <p className="text-xs text-slate-400 mt-0.5">顯示每日早/晚多次量測所得之「平均值」與「醫學理想對照線」變化。滑鼠移入可進行精準數據對比。</p>
                       </div>
                     </div>
 
@@ -1388,8 +1472,6 @@
             {/* ----------------- TAB: 雲端安全備份設定 ----------------- */}
             {activeTab === 'cloud' && (
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                
-                {/* 左側：設定控制面板 */}
                 <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-sm lg:col-span-1 space-y-5">
                   <div>
                     <h3 className="text-base font-black text-slate-900 flex items-center gap-1.5">
@@ -1490,14 +1572,12 @@
                   </div>
                 </div>
 
-                {/* 右側：讓其他人可以一鍵複製的 Apps Script 程式碼塊 */}
                 <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-sm lg:col-span-2 space-y-4">
                   <div>
                     <h3 className="text-base font-black text-slate-900">2. 雲端【智慧增量】專用 Google Apps Script 程式碼</h3>
                     <p className="text-xs text-slate-400 mt-0.5">
                       若要啟用小工具的智慧「差異同步」，請將下方最新代碼貼入您的 Google Apps Script 編輯器中取代原本代碼：
-                    </p>
-                  </div>
+                    </p>                  </div>
 
                   <div className="space-y-4 text-xs text-slate-600 leading-relaxed">
                     <div className="bg-slate-950 text-slate-300 p-3 rounded-xl font-mono text-[10px] max-h-[350px] overflow-y-auto pl-5 relative select-all cursor-pointer">
@@ -1557,7 +1637,7 @@ function doPost(e) {
 
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
     
-    // 行級差異/增量更新，大幅提升效率
+    // 行級差異/增量更新
     if (params.action === "upsertRecords") {
       var data = sheet.getDataRange().getValues();
       var idRowMap = {};
@@ -1582,7 +1662,6 @@ function doPost(e) {
       return ContentService.createTextOutput(JSON.stringify({status: "success", count: recordsToUpdate.length})).setMimeType(ContentService.MimeType.JSON);
     }
 
-    // 全量覆蓋備份功能 (備份與重置用)
     if (params.action === "saveAll") {
       sheet.clear();
       sheet.appendRow(["ID", "Date", "Period", "Avg Systolic", "Avg Diastolic", "Avg Pulse", "Raw Readings JSON"]);
@@ -1601,7 +1680,7 @@ function doPost(e) {
 }`}</pre>
                     </div>
                     <p className="text-slate-400 text-[11px]">
-                      💡 操作：複製代碼覆蓋原本腳本後，點選 **「部署」 -> 「管理部署」 -> 「編輯」 -> 選擇「建立新版本」 -> 按下「部署」** 即可。
+                      💡 操作：複製代碼覆蓋原本腳本後，點選 <strong className="text-slate-600">「部署」 → 「管理部署」 → 「編輯」 → 選擇「建立新版本」 → 按下「部署」</strong> 即可。
                     </p>
                   </div>
                 </div>
@@ -1616,7 +1695,7 @@ function doPost(e) {
                 </div>
                 <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
                   <h3 className="font-bold text-slate-950 mb-2">步驟二：正確姿勢與綁法</h3>
-                  <p className="text-xs text-slate-600">挺直靠背，不翹腳。袖帶高度需與心臟在同一水平線。</p>
+                  <p className="text-xs text-slate-600">挺直靠背，不翘腳。袖帶高度需與心臟在同一水平線。</p>
                 </div>
                 <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
                   <h3 className="font-bold text-slate-950 mb-2">步驟三：台灣 722 法則</h3>
@@ -1746,85 +1825,126 @@ function doPost(e) {
             </div>
           )}
 
-          {/* 5. A4 專業健康 PDF 報告生成專用模板 (點擊生成時才會暫時顯示以進行截圖繪製，格式固定為 A4 高質感排版) */}
-          <div id="pdf-report-area" className="hidden p-10 bg-white text-slate-900 w-[794px]" style={{ fontFamily: 'sans-serif' }}>
-            <div className="border-b-4 border-rose-500 pb-4 mb-6">
-              <div className="flex justify-between items-end">
-                <div>
-                  <h1 className="text-2xl font-black tracking-tight text-slate-900">個人血壓心率健康追蹤報告</h1>
-                  <p className="text-xs text-slate-500 mt-1">產出時間: {new Date().toLocaleString('zh-TW')} | 歷史範圍: {startDate} 至 {endDate}</p>
-                </div>
-                <div>
-                  <span className="text-xs font-bold text-rose-500 bg-rose-50 border border-rose-100 px-3 py-1 rounded-full">診斷參考文件</span>
-                </div>
-              </div>
-            </div>
-
-            {/* 報告綜合平均彙整 */}
-            <div className="grid grid-cols-3 gap-4 mb-8">
-              <div className="bg-slate-50 p-4 rounded-xl border border-slate-100">
-                <div className="text-[10px] font-bold text-slate-500">此區間綜合平均血壓</div>
-                <div className="text-xl font-black mt-1 text-slate-800">{stats.totalSysAvg} / {stats.totalDiaAvg} <span className="text-xs text-slate-400">mmHg</span></div>
-                <div className="text-[10px] text-slate-400 mt-1">分級：{getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label}</div>
-              </div>
-              <div className="bg-slate-50 p-4 rounded-xl border border-slate-100">
-                <div className="text-[10px] font-bold text-slate-500">起床 (早上) 平均值</div>
-                <div className="text-xl font-black mt-1 text-slate-800">{stats.mornSysAvg || '--'} / {stats.mornDiaAvg || '--'} <span className="text-xs text-slate-400">mmHg</span></div>
-                <div className="text-[10px] text-slate-400 mt-1">有效天數：{stats.mornCount} 天</div>
-              </div>
-              <div className="bg-slate-50 p-4 rounded-xl border border-slate-100">
-                <div className="text-[10px] font-bold text-slate-500">睡前 (晚上) 平均值</div>
-                <div className="text-xl font-black mt-1 text-slate-800">{stats.evenSysAvg || '--'} / {stats.evenDiaAvg || '--'} <span className="text-xs text-slate-400">mmHg</span></div>
-                <div className="text-[10px] text-slate-400 mt-1">有效天數：{stats.evenCount} 天</div>
-              </div>
-            </div>
-
-            {/* 圖形渲染輸出 */}
-            <div className="space-y-6 mb-8">
+          {/* =================================================================================== */}
+          {/* 🖨️ PDF 報告專用排版區塊 */}
+          {/* =================================================================================== */}
+          <div id="pdf-report-area" className="hidden absolute left-[-9999px] top-0 bg-slate-100 select-none" style={{ width: '794px' }}>
+            
+            {/* 📄 PDF 第一頁 */}
+            <div className="pdf-page-container bg-white p-10 flex flex-col justify-between" style={{ width: '794px', height: '1123px', boxSizing: 'border-box', overflow: 'hidden' }}>
               <div>
-                <h4 className="text-xs font-extrabold text-slate-800 mb-2 pl-2 border-l-4 border-rose-500">一、 收縮壓與舒張壓長期趨勢圖表</h4>
-                {renderChartWithLegend('bp', true)}
+                <div className="border-b-4 border-rose-500 pb-4 mb-6">
+                  <div className="flex justify-between items-end">
+                    <div>
+                      <h1 className="text-2xl font-black tracking-tight text-slate-900" style={{ fontFamily: 'sans-serif' }}>個人血壓心率健康追蹤報告</h1>
+                      <p className="text-[10px] text-slate-500 mt-1">
+                        產出時間: {new Date().toLocaleString('zh-TW')} | 歷史篩選範圍: {startDate} 至 {endDate}
+                      </p>
+                    </div>
+                    <div>
+                      <span className="text-[11px] font-extrabold text-rose-600 bg-rose-50 border border-rose-100 px-3 py-1 rounded-full">臨床追蹤診斷參考</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-4 mb-6">
+                  <div className="bg-slate-50 p-4 rounded-xl border border-slate-100">
+                    <div className="text-[10px] font-extrabold text-slate-500">該篩選區間綜合平均血壓</div>
+                    <div className="text-xl font-black mt-1 text-slate-800">{stats.totalSysAvg} / {stats.totalDiaAvg} <span className="text-[11px] text-slate-400 font-normal">mmHg</span></div>
+                    <div className="text-[9px] font-bold text-slate-500 mt-1">狀態分級：{getBPLevel(stats.totalSysAvg, stats.totalDiaAvg).label}</div>
+                  </div>
+                  <div className="bg-slate-50 p-4 rounded-xl border border-slate-100">
+                    <div className="text-[10px] font-extrabold text-slate-500">起床 (早上) 平均血壓</div>
+                    <div className="text-xl font-black mt-1 text-slate-800">{stats.mornSysAvg || '--'} / {stats.mornDiaAvg || '--'} <span className="text-[11px] text-slate-400 font-normal">mmHg</span></div>
+                    <div className="text-[9px] font-bold text-slate-500 mt-1">有效量測量：{stats.mornCount} 天數據</div>
+                  </div>
+                  <div className="bg-slate-50 p-4 rounded-xl border border-slate-100">
+                    <div className="text-[10px] font-extrabold text-slate-500">睡前 (晚上) 平均血壓</div>
+                    <div className="text-xl font-black mt-1 text-slate-800">{stats.evenSysAvg || '--'} / {stats.evenDiaAvg || '--'} <span className="text-[11px] text-slate-400 font-normal">mmHg</span></div>
+                    <div className="text-[9px] font-bold text-slate-500 mt-1">有效量測量：{stats.evenCount} 天數據</div>
+                  </div>
+                </div>
+
+                <div className="space-y-6">
+                  <div>
+                    <h4 className="text-xs font-black text-slate-800 mb-2 pl-2 border-l-4 border-rose-500 uppercase tracking-wide">
+                      一、 收縮壓與舒張壓長期趨勢圖表 (mmHg)
+                    </h4>
+                    {renderChartWithLegend('bp', true)}
+                  </div>
+                  <div className="pt-4 border-t border-slate-100">
+                    <h4 className="text-xs font-black text-slate-800 mb-2 pl-2 border-l-4 border-pink-500 uppercase tracking-wide">
+                      二、 平均心率變化趨勢 (bpm)
+                    </h4>
+                    {renderChartWithLegend('hr', true)}
+                  </div>
+                </div>
               </div>
-              <div className="pt-4 border-t border-slate-100">
-                <h4 className="text-xs font-extrabold text-slate-800 mb-2 pl-2 border-l-4 border-pink-500">二、 平均心率變化趨勢</h4>
-                {renderChartWithLegend('hr', true)}
+
+              <div className="text-center text-[9px] text-slate-400 border-t border-slate-100 pt-3 flex justify-between items-center">
+                <span>* 本報告僅供個人健康管理參考，非正式診斷。詳情請諮詢專業醫師。</span>
+                <span className="font-extrabold">第 1 頁 / 共 {pdfTableChunks.length + 1} 頁</span>
               </div>
             </div>
 
-            {/* 量測明細清單 (自動翻頁) */}
-            <div className="page-break"></div>
-            <div className="pt-6">
-              <h4 className="text-xs font-extrabold text-slate-800 mb-3 pl-2 border-l-4 border-slate-900">三、 量測原始數據歷史清單日誌 ({filteredRecords.length} 筆)</h4>
-              <table className="w-full text-left text-[10px] border-collapse">
-                <thead>
-                  <tr className="border-b border-slate-200 text-slate-500 font-bold bg-slate-50">
-                    <th className="py-2 px-3">日期 / 時段</th>
-                    <th className="py-2 px-3">平均血壓 (mmHg)</th>
-                    <th className="py-2 px-3">平均心跳 (bpm)</th>
-                    <th className="py-2 px-3">單次量測紀錄明細</th>
-                    <th className="py-2 px-3">狀態判定</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {filteredRecords.map((r, idx) => (
-                    <tr key={idx}>
-                      <td className="py-2 px-3 font-semibold text-slate-700">{r.date} ({r.period === 'morning' ? '🌞 早上' : '🌙 晚上'})</td>
-                      <td className="py-2 px-3 font-bold">{r.avgSystolic} / {r.avgDiastolic}</td>
-                      <td className="py-2 px-3 font-semibold">{r.avgPulse || '--'}</td>
-                      <td className="py-2 px-3 text-slate-500 font-mono">
-                        {r.readings.map((reading, i) => `[#${i+1}] ${reading.systolic}/${reading.diastolic}`).join(' ')}
-                      </td>
-                      <td className="py-2 px-3 font-semibold">{getBPLevel(r.avgSystolic, r.avgDiastolic).label}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            {/* 📄 PDF 後續表格分頁 */}
+            {pdfTableChunks.map((chunk, pageIdx) => (
+              <div key={pageIdx} className="pdf-page-container bg-white p-10 flex flex-col justify-between" style={{ width: '794px', height: '1123px', boxSizing: 'border-box', overflow: 'hidden' }}>
+                <div>
+                  <div className="border-b-2 border-slate-200 pb-2 mb-4 flex justify-between items-end">
+                    <h4 className="text-xs font-black text-slate-900 tracking-wide">
+                      三、 量測原始數據歷史清單日誌 
+                      {pageIdx > 0 ? <span className="text-rose-500 ml-1.5 font-bold">(續)</span> : ` (共 ${filteredRecords.length} 筆)`}
+                    </h4>
+                    <span className="text-[9px] text-slate-400 font-semibold">紀錄日誌表格第 {pageIdx + 1} 頁</span>
+                  </div>
 
-            <div className="mt-12 text-center text-[10px] text-slate-400 border-t border-slate-100 pt-4">
-              * 本健康分析文件僅供受測者追蹤個人生理狀態參考，非正式醫療診斷證明，診斷請諮詢專業醫師。
-            </div>
+                  <table className="w-full text-left text-[10px] border-collapse">
+                    <thead>
+                      <tr className="border-b border-slate-300 text-slate-600 font-bold bg-slate-50 text-[9px] uppercase tracking-wider">
+                        <th className="py-2.5 px-3">日期 / 時段</th>
+                        <th className="py-2.5 px-3">平均血壓 (mmHg)</th>
+                        <th className="py-2.5 px-3">平均心跳 (bpm)</th>
+                        <th className="py-2.5 px-3">單次量測紀錄明細</th>
+                        <th className="py-2.5 px-3">狀態判定</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-[9.5px]">
+                      {chunk.length > 0 ? chunk.map((r, idx) => {
+                        const bpEval = getBPLevel(r.avgSystolic, r.avgDiastolic);
+                        return (
+                          <tr key={idx} className="h-9 hover:bg-slate-50/50">
+                            <td className="py-1 px-3 font-semibold text-slate-800">
+                              {r.date} <span className="text-[9px] text-slate-400">({r.period === 'morning' ? '🌞 早上' : '🌙 晚上'})</span>
+                            </td>
+                            <td className="py-1 px-3 font-extrabold text-slate-900">{r.avgSystolic} / {r.avgDiastolic}</td>
+                            <td className="py-1 px-3 font-medium text-slate-700">{r.avgPulse || '--'}</td>
+                            <td className="py-1 px-3 text-slate-500 font-mono text-[9px]">
+                              {r.readings.map((reading, i) => `[#${i+1}] ${reading.systolic}/${reading.diastolic}`).join(' ')}
+                            </td>
+                            <td className="py-1 px-3">
+                              <span className="font-bold text-[9px]">{bpEval.label}</span>
+                            </td>
+                          </tr>
+                        );
+                      }) : (
+                        <tr>
+                          <td colSpan="5" className="py-8 text-center text-slate-400 font-medium italic">目前無符合日期範圍之歷史量測紀錄。</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="text-center text-[9px] text-slate-400 border-t border-slate-100 pt-3 flex justify-between items-center">
+                  <span>* 本資料庫已透過加密通訊傳輸至您的私有 Google Sheet 中。</span>
+                  <span className="font-extrabold">第 {pageIdx + 2} 頁 / 共 {pdfTableChunks.length + 1} 頁</span>
+                </div>
+              </div>
+            ))}
+
           </div>
+          {/* =================================================================================== */}
 
           {customConfirm && (
             <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
