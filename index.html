@@ -18,6 +18,17 @@
   <!-- 載入 PDF 導出專用核心庫 (html2canvas & jsPDF) -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+
+  <style>
+    /* 隱藏滾動條但保持滾動功能 (用於頂部導航欄行動版體驗) */
+    .no-scrollbar::-webkit-scrollbar {
+      display: none;
+    }
+    .no-scrollbar {
+      -ms-overflow-style: none;  /* IE and Edge */
+      scrollbar-width: none;  /* Firefox */
+    }
+  </style>
 </head>
 <body class="bg-slate-50">
   <div id="root"></div>
@@ -478,7 +489,7 @@
 
         } catch (error) {
           console.error(error);
-          triggerNotification('error', 'PDF 生成失敗，請確認是否安裝必要的外部庫或重試。');
+          triggerNotification('error', 'PDF 生成失敗，請確認是否安裝必要的外部庫 or 重試。');
         } finally {
           pdfArea.classList.add('hidden');
           setSyncLoading(false);
@@ -701,12 +712,10 @@
           return formatBezierPath(points);
         };
 
-        const handleMouseMove = (e) => {
-          if (isForPDF) return;
-          const svgEl = e.currentTarget;
-          const rect = svgEl.getBoundingClientRect();
-          const clientX = e.clientX - rect.left;
-          const svgX = (clientX / rect.width) * width;
+        // 滑鼠與觸控事件的共用座標對齊解析邏輯
+        const handleInteraction = (clientX, clientY, rectWidth, rectHeight, rectLeft, rectTop) => {
+          const relativeX = clientX - rectLeft;
+          const svgX = (relativeX / rectWidth) * width;
 
           let closestIdx = 0;
           let minDiff = Infinity;
@@ -721,211 +730,230 @@
           setHoveredIndex(closestIdx);
 
           const tooltipX = getX(closestIdx);
-          const clientY = e.clientY - rect.top;
-          const svgY = (clientY / rect.height) * height;
+          const relativeY = clientY - rectTop;
+          const svgY = (relativeY / rectHeight) * height;
           setTooltipPos({ 
             x: tooltipX > width - 180 ? tooltipX - 170 : tooltipX + 15, 
             y: Math.min(Math.max(svgY - 50, paddingTop), height - paddingBottom - 100) 
           });
         };
 
+        const handleMouseMove = (e) => {
+          if (isForPDF) return;
+          const svgEl = e.currentTarget;
+          const rect = svgEl.getBoundingClientRect();
+          handleInteraction(e.clientX, e.clientY, rect.width, rect.height, rect.left, rect.top);
+        };
+
+        const handleTouchMove = (e) => {
+          if (isForPDF || !e.touches || e.touches.length === 0) return;
+          const svgEl = e.currentTarget;
+          const rect = svgEl.getBoundingClientRect();
+          const touch = e.touches[0];
+          handleInteraction(touch.clientX, touch.clientY, rect.width, rect.height, rect.left, rect.top);
+        };
+
         return (
           <div className="relative">
-            <svg 
-              viewBox={`0 0 ${width} ${height}`} 
-              className="w-full min-w-[650px] h-auto select-none overflow-visible"
-              onMouseMove={handleMouseMove}
-              onMouseLeave={() => setHoveredIndex(null)}
-            >
-              {/* 1. 網格輔助水平線 */}
-              {yTicks.map(tick => {
-                const y = getY(tick);
-                return (
-                  <g key={tick}>
-                    <line x1={paddingLeft} y1={y} x2={width - paddingRight} y2={y} stroke="#f1f5f9" strokeWidth="1" />
-                    <line x1={paddingLeft} y1={y} x2={paddingLeft - 6} y2={y} stroke="#334155" strokeWidth="1.5" />
-                    <text x={paddingLeft - 12} y={y + 4} textAnchor="end" className="text-[10px] fill-slate-800 font-bold">{tick}</text>
-                  </g>
-                );
-              })}
-
-              {/* 2. X軸主刻度與日期刻度文字 */}
-              {groupedChartData.map((d, idx) => {
-                const x = getX(idx);
-                const interval = Math.ceil(groupedChartData.length / 8);
-                const showLabel = idx % interval === 0 || idx === groupedChartData.length - 1;
-                const dateObj = new Date(d.date);
-                const formattedDate = `${dateObj.getMonth() + 1}/${dateObj.getDate()}`;
-
-                return (
-                  <g key={d.date}>
-                    <line x1={x} y1={height - paddingBottom} x2={x} y2={height - paddingBottom + 6} stroke="#334155" strokeWidth="1.5" />
-                    {showLabel && (
-                      <text x={x} y={height - paddingBottom + 20} textAnchor="middle" className="text-[10px] fill-slate-800 font-bold">
-                        {formattedDate}
-                      </text>
-                    )}
-                  </g>
-                );
-              })}
-
-              {/* 3. 高對比 Y軸與 X軸 主邊界線 */}
-              <line x1={paddingLeft} y1={paddingTop} x2={paddingLeft} y2={height - paddingBottom} stroke="#334155" strokeWidth="2" />
-              <line x1={paddingLeft} y1={height - paddingBottom} x2={width - paddingRight} y2={height - paddingBottom} stroke="#334155" strokeWidth="2" />
-
-              {/* 4. 醫學理想標準參考基準線 */}
-              {type === 'bp' ? (
-                <>
-                  <line x1={paddingLeft} y1={getY(120)} x2={width - paddingRight} y2={getY(120)} stroke="#ea580c" strokeDasharray="6 4" strokeWidth="2" opacity="0.8" />
-                  <line x1={paddingLeft} y1={getY(80)} x2={width - paddingRight} y2={getY(80)} stroke="#0891b2" strokeDasharray="6 4" strokeWidth="2" opacity="0.8" />
-                </>
-              ) : (
-                <line x1={paddingLeft} y1={getY(70)} x2={width - paddingRight} y2={getY(70)} stroke="#059669" strokeDasharray="6 4" strokeWidth="2" opacity="0.8" />
-              )}
-
-              {/* 5. 互動式十字準星輔助線 (滑鼠懸浮對齊) */}
-              {!isForPDF && hoveredIndex !== null && (
-                <g>
-                  <line 
-                    x1={getX(hoveredIndex)} 
-                    y1={paddingTop} 
-                    x2={getX(hoveredIndex)} 
-                    y2={height - paddingBottom} 
-                    stroke="#slate-400" 
-                    strokeWidth="1.5" 
-                    strokeDasharray="3 3"
-                    className="stroke-slate-400"
-                  />
-                </g>
-              )}
-
-              {/* 6. 實際量測平滑貝茲數據曲線渲染 */}
-              {type === 'bp' ? (
-                <>
-                  {/* 早上收縮壓 */}
-                  {(filterPeriod === 'all' || filterPeriod === 'morning') && (
-                    <>
-                      <path d={generateBezierPathString('morning', 'avgSystolic')} fill="none" stroke="#f43f5e" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
-                      {groupedChartData.map((d, idx) => {
-                        const y = getY(d.morning?.avgSystolic);
-                        return y !== null ? (
-                          <circle key={`m-sys-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#f43f5e" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
-                        ) : null;
-                      })}
-                    </>
-                  )}
-                  {/* 早上舒張壓 */}
-                  {(filterPeriod === 'all' || filterPeriod === 'morning') && (
-                    <>
-                      <path d={generateBezierPathString('morning', 'avgDiastolic')} fill="none" stroke="#3b82f6" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
-                      {groupedChartData.map((d, idx) => {
-                        const y = getY(d.morning?.avgDiastolic);
-                        return y !== null ? (
-                          <circle key={`m-dia-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#3b82f6" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
-                        ) : null;
-                      })}
-                    </>
-                  )}
-                  {/* 晚上收縮壓 (深紅虛線平滑波形) */}
-                  {(filterPeriod === 'all' || filterPeriod === 'evening') && (
-                    <>
-                      <path d={generateBezierPathString('evening', 'avgSystolic')} fill="none" stroke="#9f1239" strokeWidth="2" strokeDasharray="6 3" strokeLinecap="round" strokeLinejoin="round" />
-                      {groupedChartData.map((d, idx) => {
-                        const y = getY(d.evening?.avgSystolic);
-                        return y !== null ? (
-                          <circle key={`e-sys-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#9f1239" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
-                        ) : null;
-                      })}
-                    </>
-                  )}
-                  {/* 晚上舒張壓 (深藍虛線平滑波形) */}
-                  {(filterPeriod === 'all' || filterPeriod === 'evening') && (
-                    <>
-                      <path d={generateBezierPathString('evening', 'avgDiastolic')} fill="none" stroke="#1d4ed8" strokeWidth="2" strokeDasharray="6 3" strokeLinecap="round" strokeLinejoin="round" />
-                      {groupedChartData.map((d, idx) => {
-                        const y = getY(d.evening?.avgDiastolic);
-                        return y !== null ? (
-                          <circle key={`e-dia-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#1d4ed8" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
-                        ) : null;
-                      })}
-                    </>
-                  )}
-                </>
-              ) : (
-                <>
-                  {/* 早上心率 */}
-                  {(filterPeriod === 'all' || filterPeriod === 'morning') && (
-                    <>
-                      <path d={generateBezierPathString('morning', 'avgPulse')} fill="none" stroke="#ec4899" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
-                      {groupedChartData.map((d, idx) => {
-                        const y = getY(d.morning?.avgPulse);
-                        return y !== null ? (
-                          <circle key={`m-pulse-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#ec4899" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
-                        ) : null;
-                      })}
-                    </>
-                  )}
-                  {/* 晚上心率 */}
-                  {(filterPeriod === 'all' || filterPeriod === 'evening') && (
-                    <>
-                      <path d={generateBezierPathString('evening', 'avgPulse')} fill="none" stroke="#8b5cf6" strokeWidth="2" strokeDasharray="6 3" strokeLinecap="round" strokeLinejoin="round" />
-                      {groupedChartData.map((d, idx) => {
-                        const y = getY(d.evening?.avgPulse);
-                        return y !== null ? (
-                          <circle key={`e-pulse-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#8b5cf6" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
-                        ) : null;
-                      })}
-                    </>
-                  )}
-                </>
-              )}
-            </svg>
-
-            {/* 7. 智慧 HTML 浮動對齊提示面板 (Tooltip) */}
-            {!isForPDF && hoveredIndex !== null && groupedChartData[hoveredIndex] && (
-              <div 
-                className="absolute z-40 bg-slate-900/90 text-white p-3 rounded-xl shadow-xl border border-slate-700 pointer-events-none text-xs backdrop-blur-xs min-w-[155px] space-y-2 transition-all duration-100 ease-out"
-                style={{ left: `${(tooltipPos.x / width) * 100}%`, top: `${tooltipPos.y}px` }}
+            {/* 行動端橫向滑動滾動盒，限制 min-w 跑版並使圖表可流暢滑動 */}
+            <div className="relative w-full overflow-x-auto pb-2 scrollbar-thin">
+              <svg 
+                viewBox={`0 0 ${width} ${height}`} 
+                className="w-full min-w-[650px] h-auto select-none overflow-visible"
+                onMouseMove={handleMouseMove}
+                onMouseLeave={() => setHoveredIndex(null)}
+                onTouchMove={handleTouchMove}
+                onTouchStart={handleTouchMove}
               >
-                <div className="font-black border-b border-slate-700 pb-1 text-[11px] tracking-wide text-slate-300">
-                  🗓️ {groupedChartData[hoveredIndex].date}
-                </div>
-                
-                {/* 早上數據摘要 */}
-                {groupedChartData[hoveredIndex].morning ? (
-                  <div className="space-y-0.5">
-                    <div className="text-amber-400 font-bold text-[10px] flex items-center gap-1">🌞 早上量測 <span className="text-[9px] text-slate-400">({groupedChartData[hoveredIndex].morning.readings.length}次)</span></div>
-                    <div className="font-mono text-[11px] pl-3">
-                      血壓: <strong className="text-white text-xs">{groupedChartData[hoveredIndex].morning.avgSystolic}/{groupedChartData[hoveredIndex].morning.avgDiastolic}</strong>
-                    </div>
-                    {type !== 'bp' && (
-                      <div className="font-mono text-[11px] pl-3 text-slate-300">
-                        心率: <span className="text-pink-400">{groupedChartData[hoveredIndex].morning.avgPulse} bpm</span>
-                      </div>
-                    )}
-                  </div>
+                {/* 1. 網格輔助水平線 */}
+                {yTicks.map(tick => {
+                  const y = getY(tick);
+                  return (
+                    <g key={tick}>
+                      <line x1={paddingLeft} y1={y} x2={width - paddingRight} y2={y} stroke="#f1f5f9" strokeWidth="1" />
+                      <line x1={paddingLeft} y1={y} x2={paddingLeft - 6} y2={y} stroke="#334155" strokeWidth="1.5" />
+                      <text x={paddingLeft - 12} y={y + 4} textAnchor="end" className="text-[10px] fill-slate-800 font-bold">{tick}</text>
+                    </g>
+                  );
+                })}
+
+                {/* 2. X軸主刻度與日期刻度文字 */}
+                {groupedChartData.map((d, idx) => {
+                  const x = getX(idx);
+                  const interval = Math.ceil(groupedChartData.length / 8);
+                  const showLabel = idx % interval === 0 || idx === groupedChartData.length - 1;
+                  const dateObj = new Date(d.date);
+                  const formattedDate = `${dateObj.getMonth() + 1}/${dateObj.getDate()}`;
+
+                  return (
+                    <g key={d.date}>
+                      <line x1={x} y1={height - paddingBottom} x2={x} y2={height - paddingBottom + 6} stroke="#334155" strokeWidth="1.5" />
+                      {showLabel && (
+                        <text x={x} y={height - paddingBottom + 20} textAnchor="middle" className="text-[10px] fill-slate-800 font-bold">
+                          {formattedDate}
+                        </text>
+                      )}
+                    </g>
+                  );
+                })}
+
+                {/* 3. 高對比 Y軸與 X軸 主邊界線 */}
+                <line x1={paddingLeft} y1={paddingTop} x2={paddingLeft} y2={height - paddingBottom} stroke="#334155" strokeWidth="2" />
+                <line x1={paddingLeft} y1={height - paddingBottom} x2={width - paddingRight} y2={height - paddingBottom} stroke="#334155" strokeWidth="2" />
+
+                {/* 4. 醫學理想標準參考基準線 */}
+                {type === 'bp' ? (
+                  <>
+                    <line x1={paddingLeft} y1={getY(120)} x2={width - paddingRight} y2={getY(120)} stroke="#ea580c" strokeDasharray="6 4" strokeWidth="2" opacity="0.8" />
+                    <line x1={paddingLeft} y1={getY(80)} x2={width - paddingRight} y2={getY(80)} stroke="#0891b2" strokeDasharray="6 4" strokeWidth="2" opacity="0.8" />
+                  </>
                 ) : (
-                  <div className="text-slate-500 text-[10px] italic">🌞 早上無紀錄</div>
+                  <line x1={paddingLeft} y1={getY(70)} x2={width - paddingRight} y2={getY(70)} stroke="#059669" strokeDasharray="6 4" strokeWidth="2" opacity="0.8" />
                 )}
 
-                {/* 晚上數據摘要 */}
-                {groupedChartData[hoveredIndex].evening ? (
-                  <div className="space-y-0.5 pt-1 border-t border-slate-800/60">
-                    <div className="text-indigo-400 font-bold text-[10px] flex items-center gap-1">🌙 晚上量測 <span className="text-[9px] text-slate-400">({groupedChartData[hoveredIndex].evening.readings.length}次)</span></div>
-                    <div className="font-mono text-[11px] pl-3">
-                      血壓: <strong className="text-white text-xs">{groupedChartData[hoveredIndex].evening.avgSystolic}/{groupedChartData[hoveredIndex].evening.avgDiastolic}</strong>
-                    </div>
-                    {type !== 'bp' && (
-                      <div className="font-mono text-[11px] pl-3 text-slate-300">
-                        心率: <span className="text-purple-400">{groupedChartData[hoveredIndex].evening.avgPulse} bpm</span>
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="text-slate-500 text-[10px] italic">🌙 晚上無紀錄</div>
+                {/* 5. 互動式十字準星輔助線 (滑鼠/觸控懸浮對齊) */}
+                {!isForPDF && hoveredIndex !== null && (
+                  <g>
+                    <line 
+                      x1={getX(hoveredIndex)} 
+                      y1={paddingTop} 
+                      x2={getX(hoveredIndex)} 
+                      y2={height - paddingBottom} 
+                      stroke="#cbd5e1" 
+                      strokeWidth="1.5" 
+                      strokeDasharray="3 3"
+                    />
+                  </g>
                 )}
-              </div>
-            )}
+
+                {/* 6. 實際量測平滑貝茲數據曲線渲染 */}
+                {type === 'bp' ? (
+                  <>
+                    {/* 早上收縮壓 */}
+                    {(filterPeriod === 'all' || filterPeriod === 'morning') && (
+                      <>
+                        <path d={generateBezierPathString('morning', 'avgSystolic')} fill="none" stroke="#f43f5e" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+                        {groupedChartData.map((d, idx) => {
+                          const y = getY(d.morning?.avgSystolic);
+                          return y !== null ? (
+                            <circle key={`m-sys-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#f43f5e" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
+                          ) : null;
+                        })}
+                      </>
+                    )}
+                    {/* 早上舒張壓 */}
+                    {(filterPeriod === 'all' || filterPeriod === 'morning') && (
+                      <>
+                        <path d={generateBezierPathString('morning', 'avgDiastolic')} fill="none" stroke="#3b82f6" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+                        {groupedChartData.map((d, idx) => {
+                          const y = getY(d.morning?.avgDiastolic);
+                          return y !== null ? (
+                            <circle key={`m-dia-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#3b82f6" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
+                          ) : null;
+                        })}
+                      </>
+                    )}
+                    {/* 晚上收縮壓 (深紅虛線平滑波形) */}
+                    {(filterPeriod === 'all' || filterPeriod === 'evening') && (
+                      <>
+                        <path d={generateBezierPathString('evening', 'avgSystolic')} fill="none" stroke="#9f1239" strokeWidth="2" strokeDasharray="6 3" strokeLinecap="round" strokeLinejoin="round" />
+                        {groupedChartData.map((d, idx) => {
+                          const y = getY(d.evening?.avgSystolic);
+                          return y !== null ? (
+                            <circle key={`e-sys-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#9f1239" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
+                          ) : null;
+                        })}
+                      </>
+                    )}
+                    {/* 晚上舒張壓 (深藍虛線平滑波形) */}
+                    {(filterPeriod === 'all' || filterPeriod === 'evening') && (
+                      <>
+                        <path d={generateBezierPathString('evening', 'avgDiastolic')} fill="none" stroke="#1d4ed8" strokeWidth="2" strokeDasharray="6 3" strokeLinecap="round" strokeLinejoin="round" />
+                        {groupedChartData.map((d, idx) => {
+                          const y = getY(d.evening?.avgDiastolic);
+                          return y !== null ? (
+                            <circle key={`e-dia-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#1d4ed8" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
+                          ) : null;
+                        })}
+                      </>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    {/* 早上心率 */}
+                    {(filterPeriod === 'all' || filterPeriod === 'morning') && (
+                      <>
+                        <path d={generateBezierPathString('morning', 'avgPulse')} fill="none" stroke="#ec4899" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+                        {groupedChartData.map((d, idx) => {
+                          const y = getY(d.morning?.avgPulse);
+                          return y !== null ? (
+                            <circle key={`m-pulse-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#ec4899" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
+                          ) : null;
+                        })}
+                      </>
+                    )}
+                    {/* 晚上心率 */}
+                    {(filterPeriod === 'all' || filterPeriod === 'evening') && (
+                      <>
+                        <path d={generateBezierPathString('evening', 'avgPulse')} fill="none" stroke="#8b5cf6" strokeWidth="2" strokeDasharray="6 3" strokeLinecap="round" strokeLinejoin="round" />
+                        {groupedChartData.map((d, idx) => {
+                          const y = getY(d.evening?.avgPulse);
+                          return y !== null ? (
+                            <circle key={`e-pulse-${idx}`} cx={getX(idx)} cy={y} r={!isForPDF && hoveredIndex === idx ? 6 : 4} fill="#8b5cf6" stroke="#ffffff" strokeWidth="1.5" className="transition-all duration-150" />
+                          ) : null;
+                        })}
+                      </>
+                    )}
+                  </>
+                )}
+              </svg>
+
+              {/* 7. 智慧 HTML 浮動對齊提示面板 (Tooltip) */}
+              {!isForPDF && hoveredIndex !== null && groupedChartData[hoveredIndex] && (
+                <div 
+                  className="absolute z-40 bg-slate-900/90 text-white p-3 rounded-xl shadow-xl border border-slate-700 pointer-events-none text-xs backdrop-blur-xs min-w-[155px] space-y-2 transition-all duration-100 ease-out"
+                  style={{ left: `${(tooltipPos.x / width) * 100}%`, top: `${tooltipPos.y}px` }}
+                >
+                  <div className="font-black border-b border-slate-700 pb-1 text-[11px] tracking-wide text-slate-300">
+                    🗓️ {groupedChartData[hoveredIndex].date}
+                  </div>
+                  
+                  {/* 早上數據摘要 */}
+                  {groupedChartData[hoveredIndex].morning ? (
+                    <div className="space-y-0.5">
+                      <div className="text-amber-400 font-bold text-[10px] flex items-center gap-1">🌞 早上量測 <span className="text-[9px] text-slate-400">({groupedChartData[hoveredIndex].morning.readings.length}次)</span></div>
+                      <div className="font-mono text-[11px] pl-3">
+                        血壓: <strong className="text-white text-xs">{groupedChartData[hoveredIndex].morning.avgSystolic}/{groupedChartData[hoveredIndex].morning.avgDiastolic}</strong>
+                      </div>
+                      {type !== 'bp' && (
+                        <div className="font-mono text-[11px] pl-3 text-slate-300">
+                          心率: <span className="text-pink-400">{groupedChartData[hoveredIndex].morning.avgPulse} bpm</span>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="text-slate-500 text-[10px] italic">🌞 早上無紀錄</div>
+                  )}
+
+                  {/* 晚上數據摘要 */}
+                  {groupedChartData[hoveredIndex].evening ? (
+                    <div className="space-y-0.5 pt-1 border-t border-slate-800/60">
+                      <div className="text-indigo-400 font-bold text-[10px] flex items-center gap-1">🌙 晚上量測 <span className="text-[9px] text-slate-400">({groupedChartData[hoveredIndex].evening.readings.length}次)</span></div>
+                      <div className="font-mono text-[11px] pl-3">
+                        血壓: <strong className="text-white text-xs">{groupedChartData[hoveredIndex].evening.avgSystolic}/{groupedChartData[hoveredIndex].evening.avgDiastolic}</strong>
+                      </div>
+                      {type !== 'bp' && (
+                        <div className="font-mono text-[11px] pl-3 text-slate-300">
+                          心率: <span className="text-purple-400">{groupedChartData[hoveredIndex].evening.avgPulse} bpm</span>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="text-slate-500 text-[10px] italic">🌙 晚上無紀錄</div>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         );
       };
@@ -1044,28 +1072,29 @@
                 </div>
               </div>
               
-              <div className="flex items-center bg-slate-100 p-1 rounded-xl">
+              {/* 導導欄容器：支援窄螢幕無損橫向滾動 */}
+              <div className="flex items-center bg-slate-100 p-1 rounded-xl overflow-x-auto max-w-full no-scrollbar whitespace-nowrap">
                 <button 
                   onClick={() => setActiveTab('dashboard')}
-                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-all duration-200 ${activeTab === 'dashboard' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-all duration-200 shrink-0 ${activeTab === 'dashboard' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
                 >
                   健康儀表板
                 </button>
                 <button 
                   onClick={() => setActiveTab('history')}
-                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-all duration-200 ${activeTab === 'history' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-all duration-200 shrink-0 ${activeTab === 'history' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
                 >
                   詳細紀錄
                 </button>
                 <button 
                   onClick={() => setActiveTab('cloud')}
-                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-all duration-200 ${activeTab === 'cloud' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-all duration-200 shrink-0 ${activeTab === 'cloud' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
                 >
                   🔒 雲端安全設定
                 </button>
                 <button 
                   onClick={() => setActiveTab('guide')}
-                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-all duration-200 ${activeTab === 'guide' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-all duration-200 shrink-0 ${activeTab === 'guide' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
                 >
                   指南
                 </button>
@@ -1319,13 +1348,13 @@
 
                 {/* 圖表區塊 */}
                 <div className="grid grid-cols-1 gap-6">
-                  <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm relative">
+                  <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm relative overflow-hidden">
                     <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 mb-6 border-b border-slate-50 pb-4">
                       <div>
                         <h3 className="text-lg font-black text-slate-900 flex items-center gap-2">
                           📈 血壓與心率趨勢圖表
                         </h3>
-                        <p className="text-xs text-slate-400 mt-0.5">顯示每日早/晚多次量測所得之「平均值」與「醫學理想對照線」變化。滑鼠移入可進行精準數據對比。</p>
+                        <p className="text-xs text-slate-400 mt-0.5 font-medium">顯示每日早/晚多次量測所得之「平均值」與「醫學理想對照線」變化。手機上可左右滑動圖表，觸碰即可精準對齊並顯示數值。</p>
                       </div>
                     </div>
 
@@ -1873,7 +1902,7 @@ function doPost(e) {
                     {renderChartWithLegend('bp', true)}
                   </div>
                   <div className="pt-4 border-t border-slate-100">
-                    <h4 className="text-xs font-black text-slate-800 mb-2 pl-2 border-l-4 border-pink-500 uppercase tracking-wide">
+                    <h4 className="text-xs font-black text-slate-900 mb-2 pl-2 border-l-4 border-pink-500 uppercase tracking-wide">
                       二、 平均心率變化趨勢 (bpm)
                     </h4>
                     {renderChartWithLegend('hr', true)}
