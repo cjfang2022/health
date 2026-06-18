@@ -61,6 +61,7 @@
           avgSystolic: Math.round(morningReadings.reduce((sum, r) => sum + r.systolic, 0) / morningCount),
           avgDiastolic: Math.round(morningReadings.reduce((sum, r) => sum + r.diastolic, 0) / morningCount),
           avgPulse: Math.round(morningReadings.reduce((sum, r) => sum + r.pulse, 0) / morningCount),
+          notes: i === 13 ? "起床量測，稍微有睡意" : i === 7 ? "剛喝完咖啡，稍微偏高" : ""
         });
 
         const eveningCount = 2;
@@ -76,6 +77,7 @@
           avgSystolic: Math.round(eveningReadings.reduce((sum, r) => sum + r.systolic, 0) / eveningCount),
           avgDiastolic: Math.round(eveningReadings.reduce((sum, r) => sum + r.diastolic, 0) / eveningCount),
           avgPulse: Math.round(eveningReadings.reduce((sum, r) => sum + r.pulse, 0) / eveningCount),
+          notes: i === 10 ? "洗澡後量測，心情放鬆" : ""
         });
       }
       return data;
@@ -131,7 +133,7 @@
       // 狀態管理 (LocalStorage 優先)
       // ----------------------------------------------------
       const [records, setRecords] = useState(() => {
-        const local = localStorage.getItem('bp_tracker_records_v2');
+        const local = localStorage.getItem('bp_tracker_records_v3');
         return local ? JSON.parse(local) : generateMockData();
       });
 
@@ -175,9 +177,11 @@
         const hour = new Date().getHours();
         return hour < 12 ? 'morning' : 'evening';
       });
+      // 手機端友善優化：預設全為空字串，方便點擊直接輸入
       const [formReadings, setFormReadings] = useState([
-        { systolic: 120, diastolic: 80, pulse: 70 }
+        { systolic: '', diastolic: '', pulse: '' }
       ]);
+      const [formNotes, setFormNotes] = useState('');
 
       // 互動式圖表指標狀態
       const [hoveredIndex, setHoveredIndex] = useState(null);
@@ -187,7 +191,7 @@
       // 自動將變更寫入 LocalStorage
       // ----------------------------------------------------
       useEffect(() => {
-        localStorage.setItem('bp_tracker_records_v2', JSON.stringify(records));
+        localStorage.setItem('bp_tracker_records_v3', JSON.stringify(records));
       }, [records]);
 
       useEffect(() => {
@@ -234,7 +238,7 @@
       };
 
       // ----------------------------------------------------
-      // 核心功能：差異增量合併同步處理
+      // 核心功能：差異增量合併同步處理 (支援第8欄備註)
       // ----------------------------------------------------
       const handleCloudSync = async () => {
         if (!gasUrl) {
@@ -284,7 +288,10 @@
           const localChanges = [];
           records.forEach(localRec => {
             const remoteRec = remoteMap.get(localRec.id);
-            if (!remoteRec || JSON.stringify(localRec.readings) !== JSON.stringify(remoteRec.readings)) {
+            // 比對 readings、以及備註內容是否一致
+            if (!remoteRec || 
+                JSON.stringify(localRec.readings) !== JSON.stringify(remoteRec.readings) ||
+                (localRec.notes || '') !== (remoteRec.notes || '')) {
               localChanges.push(localRec);
             }
           });
@@ -351,7 +358,7 @@
 
       const handleCloudExportAll = async () => {
         setCustomConfirm({
-          message: "此為全覆蓋操作，會清除雲端試算表並整批重新上傳本地所有資料，確定要繼續嗎？",
+          message: "此為全覆蓋操作，會清除雲端試算表並整批重新上傳本地所有資料（包含備註），確定要繼續嗎？",
           onConfirm: async () => {
             setCustomConfirm(null);
             setSyncLoading(true);
@@ -385,7 +392,7 @@
 
       const handleCloudImportAll = async () => {
         setCustomConfirm({
-          message: "確定要清空本地資料，並從雲端強制重新下載全部紀錄嗎？",
+          message: "確定要清空本地資料，並從雲端強制重新下載全部紀錄與備註嗎？",
           onConfirm: async () => {
             setCustomConfirm(null);
             setSyncLoading(true);
@@ -564,7 +571,9 @@
         setFormDate(new Date().toISOString().split('T')[0]);
         const hour = new Date().getHours();
         setFormPeriod(hour < 12 ? 'morning' : 'evening');
-        setFormReadings([{ systolic: 120, diastolic: 80, pulse: 70 }]);
+        // 手機端友善：初始全空字串，直接打字
+        setFormReadings([{ systolic: '', diastolic: '', pulse: '' }]);
+        setFormNotes('');
         setShowModal(true);
       };
 
@@ -573,12 +582,12 @@
         setFormDate(record.date);
         setFormPeriod(record.period);
         setFormReadings(record.readings.map(r => ({ ...r })));
+        setFormNotes(record.notes || '');
         setShowModal(true);
       };
 
       const handleAddReadingField = () => {
-        const lastReading = formReadings[formReadings.length - 1] || { systolic: 120, diastolic: 80, pulse: 70 };
-        setFormReadings([...formReadings, { ...lastReading }]);
+        setFormReadings([...formReadings, { systolic: '', diastolic: '', pulse: '' }]);
       };
 
       const handleRemoveReadingField = (index) => {
@@ -588,6 +597,7 @@
 
       const handleReadingChange = (index, field, value) => {
         const updated = [...formReadings];
+        // 如果為空，保留空字串，否則轉為整數
         updated[index][field] = value === '' ? '' : parseInt(value, 10);
         setFormReadings(updated);
       };
@@ -595,10 +605,24 @@
       const saveRecord = (e) => {
         e.preventDefault();
                 
+        // 防呆驗證：確保每一組欄位都有填寫數值
+        const hasEmpty = formReadings.some(r => 
+          r.systolic === '' || r.diastolic === '' || r.pulse === '' || 
+          isNaN(r.systolic) || isNaN(r.diastolic) || isNaN(r.pulse)
+        );
+
+        if (hasEmpty) {
+          setCustomAlert({
+            title: "⚠️ 欄位未填寫完整",
+            message: "請完整填寫每一組量測的『收縮壓、舒張壓與心率』。如果有不需要的多餘欄位，請點擊右邊的垃圾桶圖示刪除該欄位。"
+          });
+          return;
+        }
+
         const validReadings = formReadings.map(r => ({
-          systolic: typeof r.systolic === 'number' && !isNaN(r.systolic) ? r.systolic : 120,
-          diastolic: typeof r.diastolic === 'number' && !isNaN(r.diastolic) ? r.diastolic : 80,
-          pulse: typeof r.pulse === 'number' && !isNaN(r.pulse) ? r.pulse : 70
+          systolic: Number(r.systolic),
+          diastolic: Number(r.diastolic),
+          pulse: Number(r.pulse)
         }));
 
         const count = validReadings.length;
@@ -613,7 +637,8 @@
           readings: validReadings,
           avgSystolic,
           avgDiastolic,
-          avgPulse
+          avgPulse,
+          notes: formNotes.trim() // 寫入備註資訊
         };
 
         if (editId) {
@@ -623,7 +648,7 @@
           const existsIndex = records.findIndex(r => r.date === formDate && r.period === formPeriod);
           if (existsIndex > -1) {
             setCustomConfirm({
-              message: `您已記錄過 ${formDate} 的 ${formPeriod === 'morning' ? '早上' : '晚上'} 量測，要覆蓋舊紀錄嗎？`,
+              message: `您已記錄過 ${formDate} 的 ${formPeriod === 'morning' ? '早上' : '晚上'} 量測，要覆蓋舊紀錄與備註嗎？`,
               onConfirm: () => {
                 const updated = [...records];
                 updated[existsIndex] = newRecord;
@@ -652,12 +677,15 @@
       };
 
       const currentFormAvg = useMemo(() => {
-        const nums = formReadings.filter(r => typeof r.systolic === 'number' && typeof r.diastolic === 'number' && typeof r.pulse === 'number');
+        const nums = formReadings.filter(r => 
+          r.systolic !== '' && r.diastolic !== '' && r.pulse !== '' &&
+          !isNaN(r.systolic) && !isNaN(r.diastolic) && !isNaN(r.pulse)
+        );
         if (nums.length === 0) return { sys: 0, dia: 0, pulse: 0 };
         return {
-          sys: Math.round(nums.reduce((sum, r) => sum + r.systolic, 0) / nums.length),
-          dia: Math.round(nums.reduce((sum, r) => sum + r.diastolic, 0) / nums.length),
-          pulse: Math.round(nums.reduce((sum, r) => sum + r.pulse, 0) / nums.length)
+          sys: Math.round(nums.reduce((sum, r) => sum + Number(r.systolic), 0) / nums.length),
+          dia: Math.round(nums.reduce((sum, r) => sum + Number(r.diastolic), 0) / nums.length),
+          pulse: Math.round(nums.reduce((sum, r) => sum + Number(r.pulse), 0) / nums.length)
         };
       }, [formReadings]);
 
@@ -953,6 +981,13 @@
                     </div>
                   ) : (
                     <div className="text-slate-500 text-[10px] italic">🌙 晚上無紀錄</div>
+                  )}
+                  
+                  {/* 懸浮提示備註預覽 */}
+                  {(groupedChartData[hoveredIndex].morning?.notes || groupedChartData[hoveredIndex].evening?.notes) && (
+                    <div className="border-t border-slate-800/60 pt-1 text-[9px] text-rose-300 font-medium leading-relaxed max-w-[150px] whitespace-normal">
+                      💬 {groupedChartData[hoveredIndex].morning?.notes || groupedChartData[hoveredIndex].evening?.notes}
+                    </div>
                   )}
                 </div>
               )}
@@ -1357,7 +1392,7 @@
                         <h3 className="text-lg font-black text-slate-900 flex items-center gap-2">
                           📈 血壓與心率趨勢圖表
                         </h3>
-                        <p className="text-xs text-slate-400 mt-0.5 font-medium">顯示每日早/晚多次量測所得之「平均值」與「醫學理想對照線」變化。手機上可左右滑動圖表，觸碰即可精準對齊並顯示數值。</p>
+                        <p className="text-xs text-slate-400 mt-0.5 font-medium">顯示每日早/晚多次量測所得之「平均值」與「醫學理想對照線」變化。手機上可左右滑動圖表，觸碰即可精準對齊並顯示數值與健康備註。</p>
                       </div>
                     </div>
 
@@ -1437,6 +1472,12 @@
                                     </span>
                                   </div>
                                 </div>
+                                {/* 備註細節呈現 */}
+                                {r.notes && (
+                                  <div className="mt-1.5 max-w-[200px] bg-rose-50/70 border border-rose-100 text-slate-700 text-[11px] font-medium px-2 py-1 rounded-lg leading-relaxed whitespace-normal" title={r.notes}>
+                                    💬 <span className="font-bold text-slate-800">備註：</span>{r.notes}
+                                  </div>
+                                )}
                               </td>
                               <td className="py-4 px-4 font-black text-sm text-slate-800">
                                 {r.avgSystolic} <span className="text-slate-300 font-normal">/</span> {r.avgDiastolic}
@@ -1594,7 +1635,7 @@
                       <button
                         onClick={() => {
                           setCustomConfirm({
-                            message: "確定要將本機數據『完全重設』為預設模擬資料嗎？這將會覆蓋您本機現有的紀錄！",
+                            message: "確定要將本機數據『完全重設』為預設模擬資料嗎？這將會覆蓋您本機現有的紀錄與備註！",
                             onConfirm: () => {
                               setRecords(generateMockData());
                               setCustomConfirm(null);
@@ -1609,7 +1650,7 @@
                       <button
                         onClick={() => {
                           setCustomConfirm({
-                            message: "確定要清空本機的所有資料嗎？清空後將無法復原（除非您已備份至雲端）。",
+                            message: "確定要清空本機的所有資料與備註嗎？清空後將無法復原（除非您已備份至雲端）。",
                             onConfirm: () => {
                               setRecords([]);
                               setCustomConfirm(null);
@@ -1629,7 +1670,7 @@
                   <div>
                     <h3 className="text-base font-black text-slate-900">2. 雲端【智慧增量】專用 Google Apps Script 程式碼</h3>
                     <p className="text-xs text-slate-400 mt-0.5">
-                      若要啟用小工具的智慧「差異同步」，請將下方最新代碼貼入您的 Google Apps Script 編輯器中取代原本代碼：
+                      若要啟用包含「備註（Notes）」的智慧差異同步，請複製下方**最新升級版 (第8欄支援)** 代碼貼入您的 GAS 中部署：
                     </p>                  </div>
 
                   <div className="space-y-4 text-xs text-slate-600 leading-relaxed">
@@ -1662,7 +1703,8 @@ function doGet(e) {
             avgSystolic: parseInt(data[i][3]) || 0,
             avgDiastolic: parseInt(data[i][4]) || 0,
             avgPulse: parseInt(data[i][5]) || 0,
-            readings: JSON.parse(data[i][6] || "[]")
+            readings: JSON.parse(data[i][6] || "[]"),
+            notes: data[i][7] ? data[i][7].toString() : "" // 新增第8欄 (H欄) 備註解析
           });
         } catch(err) {}
       }
@@ -1690,7 +1732,7 @@ function doPost(e) {
 
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
     
-    // 行級差異/增量更新
+    // 行級差異/增量更新 (包含備註，寬度擴充至 8)
     if (params.action === "upsertRecords") {
       var data = sheet.getDataRange().getValues();
       var idRowMap = {};
@@ -1704,10 +1746,11 @@ function doPost(e) {
       for (var j = 0; j < recordsToUpdate.length; j++) {
         var r = recordsToUpdate[j];
         var rowIndex = idRowMap[r.id];
-        var rowData = [r.id, r.date, r.period, r.avgSystolic, r.avgDiastolic, r.avgPulse, JSON.stringify(r.readings)];
+        // 陣列末端新增備註 (rowData 長度為 8)
+        var rowData = [r.id, r.date, r.period, r.avgSystolic, r.avgDiastolic, r.avgPulse, JSON.stringify(r.readings), r.notes || ""];
         
         if (rowIndex) {
-          sheet.getRange(rowIndex, 1, 1, 7).setValues([rowData]);
+          sheet.getRange(rowIndex, 1, 1, 8).setValues([rowData]); // 寬度改為 8 欄
         } else {
           sheet.appendRow(rowData);
         }
@@ -1717,11 +1760,12 @@ function doPost(e) {
 
     if (params.action === "saveAll") {
       sheet.clear();
-      sheet.appendRow(["ID", "Date", "Period", "Avg Systolic", "Avg Diastolic", "Avg Pulse", "Raw Readings JSON"]);
+      // 表頭新增「Notes (備註)」
+      sheet.appendRow(["ID", "Date", "Period", "Avg Systolic", "Avg Diastolic", "Avg Pulse", "Raw Readings JSON", "Notes"]);
       var records = params.records;
       for (var i = 0; i < records.length; i++) {
         var r = records[i];
-        sheet.appendRow([r.id, r.date, r.period, r.avgSystolic, r.avgDiastolic, r.avgPulse, JSON.stringify(r.readings)]);
+        sheet.appendRow([r.id, r.date, r.period, r.avgSystolic, r.avgDiastolic, r.avgPulse, JSON.stringify(r.readings), r.notes || ""]);
       }
       return ContentService.createTextOutput(JSON.stringify({status: "success"})).setMimeType(ContentService.MimeType.JSON);
     }
@@ -1758,14 +1802,14 @@ function doPost(e) {
             )}
           </main>
 
-          {/* 4. 新增/編輯視窗 */}
+          {/* 4. 新增/編輯視窗 (改良行動端快速空白鍵盤 + 新增備註欄位) */}
           {showModal && (
             <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
               <div className="bg-white rounded-3xl w-full max-w-lg shadow-2xl border border-slate-100 overflow-hidden transform transition-all">
                 <div className="px-6 py-4 bg-slate-900 text-white flex items-center justify-between">
                   <div>
                     <h3 className="text-base font-extrabold">{editId ? '修改量測紀錄' : '新增量測紀錄'}</h3>
-                    <p className="text-[10px] text-slate-400 mt-0.5">早上或晚上量測 $n$ 次，自動計算該時段平均值</p>
+                    <p className="text-[10px] text-slate-400 mt-0.5">早上或晚上量測 $n$ 次，自動計算平均值，並可新增健康狀況備註</p>
                   </div>
                   <button onClick={() => setShowModal(false)} className="p-1 text-slate-400 hover:text-white">✕</button>
                 </div>
@@ -1805,8 +1849,8 @@ function doPost(e) {
 
                   <div className="border-t border-slate-100 pt-4 space-y-3">
                     <div className="flex items-center justify-between">
-                      <span className="text-xs font-bold text-slate-600">量測數據 (可新增多次取平均值)</span>
-                      <button type="button" onClick={handleAddReadingField} className="text-xs text-rose-500 hover:text-rose-600 font-bold">＋ 新增一次量測</button>
+                      <span className="text-xs font-bold text-slate-600">量測數據 (空欄位，直接輸入即可)</span>
+                      <button type="button" onClick={handleAddReadingField} className="text-xs text-rose-500 hover:text-rose-600 font-bold">＋ 新增一回量測</button>
                     </div>
 
                     <div className="max-h-56 overflow-y-auto pr-1 space-y-3">
@@ -1821,27 +1865,33 @@ function doPost(e) {
                               <span className="text-[10px] font-bold text-slate-500 text-center">收縮壓 (高壓)</span>
                               <input 
                                 type="number" required min="50" max="250"
+                                inputMode="numeric"
+                                placeholder="例: 120"
                                 value={reading.systolic}
                                 onChange={(e) => handleReadingChange(index, 'systolic', e.target.value)}
-                                className="bg-white border border-slate-200 rounded-lg py-1 px-2 text-center text-sm font-bold text-slate-800"
+                                className="bg-white border border-slate-200 rounded-lg py-1 px-2 text-center text-sm font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-rose-500 placeholder-slate-300"
                               />
                             </div>
                             <div className="flex flex-col gap-1">
                               <span className="text-[10px] font-bold text-slate-500 text-center">舒張壓 (低壓)</span>
                               <input 
                                 type="number" required min="30" max="150"
+                                inputMode="numeric"
+                                placeholder="例: 80"
                                 value={reading.diastolic}
                                 onChange={(e) => handleReadingChange(index, 'diastolic', e.target.value)}
-                                className="bg-white border border-slate-200 rounded-lg py-1 px-2 text-center text-sm font-bold text-slate-800"
+                                className="bg-white border border-slate-200 rounded-lg py-1 px-2 text-center text-sm font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-rose-500 placeholder-slate-300"
                               />
                             </div>
                             <div className="flex flex-col gap-1">
                               <span className="text-[10px] font-bold text-slate-500 text-center">心率 (心跳)</span>
                               <input 
                                 type="number" required min="30" max="200"
-                                value={reading.pulse || ''}
+                                inputMode="numeric"
+                                placeholder="例: 70"
+                                value={reading.pulse}
                                 onChange={(e) => handleReadingChange(index, 'pulse', e.target.value)}
-                                className="bg-white border border-slate-200 rounded-lg py-1 px-2 text-center text-sm font-bold text-slate-800"
+                                className="bg-white border border-slate-200 rounded-lg py-1 px-2 text-center text-sm font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-rose-500 placeholder-slate-300"
                               />
                             </div>
                           </div>
@@ -1854,10 +1904,26 @@ function doPost(e) {
                     </div>
                   </div>
 
+                  {/* 新增備註文字框 */}
+                  <div className="border-t border-slate-100 pt-3 flex flex-col gap-1.5">
+                    <label className="text-xs font-bold text-slate-600 flex items-center gap-1.5">
+                      💬 備註 / 身體狀況
+                      <span className="text-[10px] text-slate-400 font-normal">(例: 剛洗完澡、有些頭痛、運動後)</span>
+                    </label>
+                    <textarea
+                      value={formNotes}
+                      onChange={(e) => setFormNotes(e.target.value)}
+                      placeholder="請輸入今天量測時的特別身體狀況狀況 (選填，最多100字)..."
+                      rows="2"
+                      maxLength="100"
+                      className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-700 focus:outline-none focus:ring-2 focus:ring-rose-500 placeholder-slate-400"
+                    />
+                  </div>
+
                   <div className="bg-rose-50/50 rounded-2xl p-4 border border-rose-100 flex items-center justify-between">
                     <div>
                       <h4 className="text-xs font-extrabold text-slate-700">本次量測平均結果 ($n={formReadings.length}$)</h4>
-                      <p className="text-[10px] text-slate-400 mt-0.5">儲存後系統將自動將平均值繪製進趨勢圖</p>
+                      <p className="text-[10px] text-slate-400 mt-0.5">儲存後系統將自動將平均值與備註一併寫入紀錄</p>
                     </div>
                     <div className="text-right">
                       <div className="text-sm font-black text-slate-800">
@@ -1940,7 +2006,7 @@ function doPost(e) {
               </div>
             </div>
 
-            {/* 📄 PDF 後續表格分頁 */}
+            {/* 📄 PDF 後續表格分頁 (支援備註欄位呈現) */}
             {pdfTableChunks.map((chunk, pageIdx) => (
               <div key={pageIdx} className="pdf-page-container bg-white p-10 flex flex-col justify-between" style={{ width: '794px', height: '1123px', boxSizing: 'border-box', overflow: 'hidden' }}>
                 <div>
@@ -1958,7 +2024,7 @@ function doPost(e) {
                         <th className="py-2.5 px-3">日期 / 時段</th>
                         <th className="py-2.5 px-3">平均血壓 (mmHg)</th>
                         <th className="py-2.5 px-3">平均心跳 (bpm)</th>
-                        <th className="py-2.5 px-3">單次量測紀錄明細</th>
+                        <th className="py-2.5 px-3">單次量測與特別備註</th>
                         <th className="py-2.5 px-3">狀態判定</th>
                       </tr>
                     </thead>
@@ -1966,14 +2032,16 @@ function doPost(e) {
                       {chunk.length > 0 ? chunk.map((r, idx) => {
                         const bpEval = getBPLevel(r.avgSystolic, r.avgDiastolic);
                         return (
-                          <tr key={idx} className="h-9 hover:bg-slate-50/50">
+                          <tr key={idx} className="h-11 hover:bg-slate-50/50">
                             <td className="py-1 px-3 font-semibold text-slate-800">
                               {r.date} <span className="text-[9px] text-slate-400">({r.period === 'morning' ? '🌞 早上' : '🌙 晚上'})</span>
                             </td>
                             <td className="py-1 px-3 font-extrabold text-slate-900">{r.avgSystolic} / {r.avgDiastolic}</td>
                             <td className="py-1 px-3 font-medium text-slate-700">{r.avgPulse || '--'}</td>
+                            {/* 明細及備註整合 */}
                             <td className="py-1 px-3 text-slate-500 font-mono text-[9px]">
-                              {r.readings.map((reading, i) => `[#${i+1}] ${reading.systolic}/${reading.diastolic}`).join(' ')}
+                              <div>{r.readings.map((reading, i) => `[#${i+1}] ${reading.systolic}/${reading.diastolic}`).join(' ')}</div>
+                              {r.notes && <div className="text-rose-600 font-sans mt-0.5 font-medium">💬 備註: {r.notes}</div>}
                             </td>
                             <td className="py-1 px-3">
                               <span className="font-bold text-[9px]">{bpEval.label}</span>
